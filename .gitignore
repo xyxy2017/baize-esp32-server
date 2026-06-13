@@ -179,7 +179,9 @@ uploadfile
 *.json
 .vscode
 .cursor
- 
+.qoder/
+openspec/
+
 !package.json
 !**/package.json
 
