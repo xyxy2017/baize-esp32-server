@@ -9,6 +9,9 @@ on:
       - 'Dockerfile-server-base'
       - '.github/workflows/build-base-image.yml'
 
+env:
+  REPO_NAMESPACE: broussia
+
 jobs:
   build-base:
     name: Build and push server base image
@@ -27,7 +30,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: ${{ env.REPO_NAMESPACE }}
           password: ${{ secrets.TOKEN }}
 
       - name: Build and push server-base
@@ -36,7 +39,7 @@ jobs:
           context: .
           file: Dockerfile-server-base
           push: true
-          tags: ghcr.io/${{ github.repository }}:server-base
+          tags: ghcr.io/${{ env.REPO_NAMESPACE }}/baize-esp32-server:server-base
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha,scope=server-base
           cache-to: type=gha,mode=max,scope=server-base
@@ -46,4 +49,4 @@ jobs:
       - name: Output image info
         run: |
           echo "✅ Base image built and pushed successfully!"
-          echo "📦 Tag: ghcr.io/${{ github.repository }}:server-base"
+          echo "📦 Tag: ghcr.io/${{ env.REPO_NAMESPACE }}/baize-esp32-server:server-base"
