@@ -27,6 +27,9 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
         conn.tts.tts_audio_first_sentence = False
 
     if sentenceType == SentenceType.FIRST:
+        metrics = getattr(conn, "current_metrics", None)
+        if metrics:
+            metrics.mark("tts_sentence_start", text_len=len(text or ""))
         # 同一句子的后续消息加入流控队列，其他情况立即发送
         if (
             hasattr(conn, "audio_rate_controller")
@@ -259,6 +262,15 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
         # 直接发送opus数据包
         await conn.websocket.send(opus_packet)
 
+    metrics = getattr(conn, "current_metrics", None)
+    if metrics and not metrics.first_audio_sent:
+        metrics.first_audio_sent = True
+        metrics.mark(
+            "first_audio_sent",
+            bytes=len(opus_packet or b""),
+            mqtt=bool(conn.conn_from_mqtt_gateway),
+        )
+
     # 更新流控状态
     flow_control["packet_count"] = packet_index + 1
     flow_control["sequence"] = sequence + 1
@@ -295,6 +307,11 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
         if hasattr(conn, "audio_rate_controller") and conn.audio_rate_controller:
             conn.audio_rate_controller.stop_sending()
         conn.clearSpeakStatus()
+        metrics = getattr(conn, "current_metrics", None)
+        if metrics:
+            metrics.mark("tts_stop")
+            conn.logger.bind(tag=TAG).info(metrics.format_summary())
+            conn.current_metrics = None
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))

@@ -12,6 +12,7 @@ from aiohttp import web
 from core.auth import AuthManager
 from core.utils.util import get_local_ip, get_vision_url
 from core.api.base_handler import BaseHandler
+from core.api.app_demo_store import update_device_report, update_ota_report
 
 TAG = __name__
 
@@ -140,6 +141,14 @@ class OTAHandler(BaseHandler):
         else:
             return f"ws://{local_ip}:{port}/xiaozhi/v1/"
 
+    def _get_ota_download_url(self, filename: str, local_ip: str, http_port: int) -> str:
+        vision_url = get_vision_url(self.config)
+        if vision_url:
+            return vision_url.replace(
+                "/mcp/vision/explain", f"/xiaozhi/ota/download/{filename}"
+            )
+        return f"http://{local_ip}:{http_port}/xiaozhi/ota/download/{filename}"
+
     async def handle_post(self, request):
         """处理 OTA POST 请求
 
@@ -219,6 +228,14 @@ class OTAHandler(BaseHandler):
                     device_version = ""
             if not device_version:
                 device_version = "0.0.0"
+
+            update_device_report(
+                self.config,
+                source_device_id=device_id,
+                client_id=client_id,
+                model=device_model,
+                firmware_version=device_version,
+            )
 
             return_json = {
                 "server_time": {
@@ -315,21 +332,32 @@ class OTAHandler(BaseHandler):
                     if _is_higher_version(ver, device_version):
                         # build download url (only allow download via our download endpoint)
                         chosen_version = ver
-                        # Use get_vision_url to get the base URL and replace the path
-                        vision_url = get_vision_url(self.config)
-                        # Replace the path from "/mcp/vision/explain" to "/xiaozhi/ota/download/{fname}"
-                        chosen_url = vision_url.replace(
-                            "/mcp/vision/explain", f"/xiaozhi/ota/download/{fname}"
+                        chosen_url = self._get_ota_download_url(
+                            fname, local_ip, http_port
                         )
                         break
 
                 if chosen_url:
                     return_json["firmware"]["version"] = chosen_version
                     return_json["firmware"]["url"] = chosen_url
+                    update_ota_report(
+                        self.config,
+                        current_version=device_version,
+                        latest_version=chosen_version,
+                        update_available=True,
+                        release_note=f"发现可用固件版本 {chosen_version}",
+                    )
                     self.logger.bind(tag=TAG).info(
                         f"为设备 {device_id} 下发固件 {chosen_version} [如果地址前缀有误，请检查配置文件中的server.vision_explain]-> {chosen_url} "
                     )
                 else:
+                    update_ota_report(
+                        self.config,
+                        current_version=device_version,
+                        latest_version=device_version,
+                        update_available=False,
+                        release_note=f"设备当前版本 {device_version}",
+                    )
                     self.logger.bind(tag=TAG).info(
                         f"设备 {device_id} 固件已是最新: {device_version}"
                     )

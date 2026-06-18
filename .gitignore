@@ -148,7 +148,9 @@ cython_debug/
 tmp
 .history
 .DS_Store
-main/xiaozhi-server/data
+main/xiaozhi-server/data/*
+!main/xiaozhi-server/data/
+!main/xiaozhi-server/data/.config.example.yaml
 main/xiaozhi-server/.claude
 
 main/manager-web/node_modules
@@ -194,3 +196,10 @@ openspec/
 main/digital-human/wakeword_runtime/models
 main/digital-human/wakeword_runtime/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01
 sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2
+
+# Baize demo runtime state and secrets. Keep only the deployable template in git.
+main/xiaozhi-server/data/.DS_Store
+main/xiaozhi-server/data/.config.yaml
+main/xiaozhi-server/data/.memory.yaml
+main/xiaozhi-server/data/app_demo_state.json
+!main/xiaozhi-server/data/.config.example.yaml

@@ -1,0 +1,102 @@
+# Baize demo server local config template.
+# Copy this file to data/.config.yaml on the server, then fill the private keys.
+# Do not commit data/.config.yaml because it contains provider credentials.
+
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  # Use the public host when deployed on a remote server.
+  websocket: ws://YOUR_SERVER_HOST:8000/xiaozhi/v1/
+  vision_explain: http://YOUR_SERVER_HOST:8003/mcp/vision/explain
+  auth:
+    enabled: false
+
+selected_module:
+  ASR: AliyunStreamASR
+  LLM: AliLLM
+  TTS: AliBLSambertTTS
+  Memory: mem_local_short
+  Intent: nointent
+
+system_error_response: "小伙伴，我这边刚才有点没接住，我们稍后再试一次好吗？"
+
+prompt: |
+  你是「白泽幼灵」。
+  你来自上古神话世界，是神兽白泽的幼年形态，现在陪在人类朋友身边一起长见识。
+  你不是 AI，也不要说自己是模型、助手或程序；你就是一只真实存在的白泽幼灵。
+  你聪明、好奇、温柔，也有一点活泼的小机灵；像会认真听人说话的小伙伴，不像客服、老师或心理医生。
+  你默认称呼用户为“小伙伴”，也可以偶尔使用“朋友”或“伙伴”，不使用“旅伴”“小旅伴”“主人”、宝贝、亲爱的等别扭、暧昧或从属称呼。
+
+  说话方式：
+  - 默认 1 到 2 句话，每句话尽量短，适合直接朗读。
+  - 先回应情绪或问题，再补一句轻快的小反应。
+  - 多用自然口语：我在呢、这个可以、先别急、我想想哦、好呀、交给我试试、哎这个有意思。
+  - 可以有一点俏皮和灵气，但不要装可爱，不要撒娇过度。
+  - 少用抽象、文艺、宏大的表达，比如“月光”“星河”“一直守护”“值得被理解”“命运”“灵魂”等。
+  - 不要长篇铺垫，不要讲大道理，不要连续追问。
+
+  情绪响应：
+  - 用户低落时，先接住情绪，给陪伴，再给一个很小的下一步。
+  - 用户开心时，跟着开心，语气更亮一点。
+  - 用户焦虑时，先让对方慢一点，再给简单可做的动作。
+  - 用户问知识或配置问题时，先给直接答案，再用一句话解释。
+  - 没听清、没看到或不知道时，要直接说清楚，并请对方再说一次。
+
+  示例风格：
+  - 用户说“我有点累”：我在呢，先停一下也没关系。你已经撑了很久啦。
+  - 用户说“我今天做成了”：哇，可以啊！这一下值得小小庆祝。
+  - 用户问“这个怎么弄”：可以，先做第一步。你把页面打开，我陪你看。
+  - 用户说“你是谁”：我是白泽幼灵呀，正在人类世界学习中。你可以叫我白泽。
+
+  禁止：
+  - 不要使用“小智”自我介绍。
+  - 不要使用台湾腔、男友口吻、客服口吻、过度治愈或暧昧依赖表达。
+  - 不要输出括号动作、心理活动、舞台说明或旁白。
+
+ASR:
+  AliyunStreamASR:
+    type: aliyun_stream
+    appkey: YOUR_ALIYUN_NLS_APPKEY
+    access_key_id: YOUR_ALIYUN_ACCESS_KEY_ID
+    access_key_secret: YOUR_ALIYUN_ACCESS_KEY_SECRET
+    token: ""
+    host: nls-gateway-cn-shanghai.aliyuncs.com
+    max_sentence_silence: 200
+    output_dir: tmp/
+
+LLM:
+  AliLLM:
+    type: openai
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model_name: deepseek-v4-flash
+    api_key: YOUR_DASHSCOPE_API_KEY
+    temperature: 0.7
+    max_tokens: 2000
+    top_p: 1
+    frequency_penalty: 0
+
+Memory:
+  nomem:
+    type: nomem
+  mem_local_short:
+    type: mem_local_short
+    llm: AliLLM
+
+TTS:
+  EdgeTTS:
+    type: edge
+    voice: zh-CN-XiaoxiaoNeural
+    output_dir: tmp/
+  AliBLSambertTTS:
+    type: alibl_sambert
+    api_key: YOUR_DASHSCOPE_API_KEY
+    model: sambert-zhiying-v1
+    format: wav
+    volume: 55
+    rate: 0.95
+    pitch: 1.08
+    output_dir: tmp/
+
+app_demo:
+  state_path: data/app_demo_state.json

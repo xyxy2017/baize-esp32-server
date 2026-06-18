@@ -10,6 +10,7 @@ from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
+from core.utils.conversation_metrics import ConversationMetrics
 
 TAG = __name__
 
@@ -37,6 +38,8 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
 
 
 async def startToChat(conn: "ConnectionHandler", text):
+    conn.current_metrics = ConversationMetrics()
+
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     language_tag = None
@@ -64,6 +67,10 @@ async def startToChat(conn: "ConnectionHandler", text):
     else:
         conn.current_speaker = None
 
+    if conn.current_metrics:
+        conn.current_metrics.set_question(actual_text)
+        conn.current_metrics.mark("asr_final", text_len=len(actual_text or ""))
+
     if conn.need_bind:
         await check_bind_device(conn)
         return
@@ -81,18 +88,30 @@ async def startToChat(conn: "ConnectionHandler", text):
         await handleAbortMessage(conn)
 
     # 首先进行意图分析，使用实际文本内容
+    if conn.current_metrics:
+        conn.current_metrics.mark("intent_start")
     intent_handled = await handle_user_intent(conn, actual_text)
+    if conn.current_metrics:
+        conn.current_metrics.mark("intent_done", handled=bool(intent_handled))
 
     if intent_handled:
         # 如果意图已被处理，不再进行聊天
+        if conn.current_metrics:
+            conn.current_metrics.mark("intent_handled_stop")
+            conn.logger.bind(tag=TAG).info(conn.current_metrics.format_summary())
+            conn.current_metrics = None
         return
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
     await send_stt_message(conn, actual_text)
+    if conn.current_metrics:
+        conn.current_metrics.mark("stt_message_sent")
 
     # 准备开始新会话
     conn.client_abort = False
 
+    if conn.current_metrics:
+        conn.current_metrics.mark("chat_submit")
     conn.executor.submit(conn.chat, actual_text)
 
 

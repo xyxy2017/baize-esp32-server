@@ -5,6 +5,29 @@ if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 
 TAG = __name__
+BAIZE_SUPPORTED_EMOTIONS = {
+    "neutral",
+    "happy",
+    "laughing",
+    "funny",
+    "sad",
+    "angry",
+    "crying",
+    "loving",
+    "embarrassed",
+    "surprised",
+    "shocked",
+    "thinking",
+    "winking",
+    "cool",
+    "relaxed",
+    "delicious",
+    "kissy",
+    "confident",
+    "sleepy",
+    "silly",
+    "confused",
+}
 EMOJI_MAP = {
     "😂": "funny",
     "😭": "crying",
@@ -28,6 +51,37 @@ EMOJI_MAP = {
     "😘": "kissy",
     "😏": "confident",
 }
+EMOTION_EMOJI_MAP = {
+    "neutral": "😶",
+    "happy": "🙂",
+    "laughing": "😆",
+    "funny": "😂",
+    "sad": "😔",
+    "angry": "😠",
+    "crying": "😭",
+    "loving": "😍",
+    "embarrassed": "😳",
+    "surprised": "😲",
+    "shocked": "😱",
+    "thinking": "🤔",
+    "winking": "😉",
+    "cool": "😎",
+    "relaxed": "😌",
+    "delicious": "🤤",
+    "kissy": "😘",
+    "confident": "😏",
+    "sleepy": "😴",
+    "silly": "😜",
+    "confused": "🙄",
+}
+TEXT_EMOTION_HINTS = (
+    ("thinking", ("想想", "我想", "思考", "琢磨", "谜题", "让我看看")),
+    ("confused", ("没听清", "没太听清", "再说一遍", "不太明白", "确认一下")),
+    ("relaxed", ("别急", "慢慢来", "陪你", "别怕", "守着你")),
+    ("sad", ("难过", "低落", "委屈", "伤心", "失落")),
+    ("surprised", ("哇", "呀", "竟然", "原来")),
+    ("laughing", ("开心", "太好了", "真棒", "好厉害", "发光")),
+)
 EMOJI_RANGES = [
     (0x1F600, 0x1F64F),
     (0x1F300, 0x1F5FF),
@@ -37,6 +91,26 @@ EMOJI_RANGES = [
     (0x2600, 0x26FF),
     (0x2700, 0x27BF),
 ]
+
+
+def select_baize_emotion(text: str, fallback: str = "neutral") -> dict:
+    """Select a device-supported emotion and matching prompt emoji."""
+    normalized_fallback = fallback if fallback in BAIZE_SUPPORTED_EMOTIONS else "neutral"
+    stripped = (text or "").strip()
+    for char in stripped:
+        if char in EMOJI_MAP:
+            emotion = EMOJI_MAP[char]
+            return {
+                "emoji": char,
+                "emotion": emotion if emotion in BAIZE_SUPPORTED_EMOTIONS else normalized_fallback,
+            }
+    for emotion, hints in TEXT_EMOTION_HINTS:
+        if any(hint in stripped for hint in hints):
+            return {"emoji": EMOTION_EMOJI_MAP[emotion], "emotion": emotion}
+    return {
+        "emoji": EMOTION_EMOJI_MAP[normalized_fallback],
+        "emotion": normalized_fallback,
+    }
 
 
 def get_string_no_punctuation_or_emoji(s):
@@ -83,13 +157,10 @@ def is_punctuation_or_emoji(char):
 
 async def get_emotion(conn: "ConnectionHandler", text):
     """获取文本内的情绪消息"""
-    emoji = "🙂"
-    emotion = "happy"
-    for char in text:
-        if char in EMOJI_MAP:
-            emoji = char
-            emotion = EMOJI_MAP[char]
-            break
+    selected = select_baize_emotion(text)
+    emoji = selected["emoji"]
+    emotion = selected["emotion"]
+    conn.latest_emotion = emotion
     try:
         await conn.websocket.send(
             json.dumps(
@@ -101,6 +172,9 @@ async def get_emotion(conn: "ConnectionHandler", text):
                 }
             )
         )
+        metrics = getattr(conn, "current_metrics", None)
+        if metrics:
+            metrics.mark("emotion_ws_sent", emotion=emotion)
     except Exception as e:
         conn.logger.bind(tag=TAG).warning(f"发送情绪表情失败，错误:{e}")
     return

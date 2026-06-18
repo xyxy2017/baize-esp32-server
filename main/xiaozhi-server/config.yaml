@@ -52,6 +52,8 @@ log:
   log_dir: tmp
   # 设置日志文件
   log_file: "server.log"
+  # 设置对话耗时统计日志文件
+  metrics_log_file: "conversation_metrics.log"
   # 设置数据文件路径
   data_dir: data
 
@@ -1146,6 +1148,17 @@ TTS:
     # rate: 1  # 语速：0.5~2
     # pitch: 1  # 语调：0.5~2
     # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
+  AliBLSambertTTS:
+    # 阿里云百炼 Sambert 语音合成。知颖为软萌童声：sambert-zhiying-v1
+    # Sambert 不支持双向流式输入，适合 Demo 先验证白泽音色；后续可再切 CosyVoice/Qwen-TTS。
+    type: alibl_sambert
+    api_key: 你的百炼APIKey
+    model: "sambert-zhiying-v1"
+    output_dir: tmp/
+    format: wav
+    volume: 55
+    rate: 0.95
+    pitch: 1.08
   XunFeiTTS:
     # 讯飞TTS服务 官方网站：https://www.xfyun.cn/
     # 登录讯飞语音技术平台 https://console.xfyun.cn/app/myapp 创建相关应用

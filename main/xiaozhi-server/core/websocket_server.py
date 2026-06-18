@@ -40,9 +40,10 @@ TAG = __name__
 
 
 class WebSocketServer:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, device_registry=None):
         self.config = config
         self.logger = setup_logging()
+        self.device_registry = device_registry
         self.config_lock = asyncio.Lock()
         modules = initialize_modules(
             self.logger,
