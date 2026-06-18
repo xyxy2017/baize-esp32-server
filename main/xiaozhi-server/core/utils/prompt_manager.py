@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from config.logger import setup_logging
 from jinja2 import Template
+from core.api.app_demo_store import prompt_context_for_device
 
 TAG = __name__
 
@@ -231,6 +232,10 @@ class PromptManager:
             return user_prompt
 
         try:
+            app_device_context = prompt_context_for_device(self.config, device_id)
+            if app_device_context:
+                user_prompt = f"{user_prompt.rstrip()}\n{app_device_context}"
+
             # 获取最新的时间信息（不缓存）
             today_date, today_weekday, lunar_date = self._get_current_time_info()
 

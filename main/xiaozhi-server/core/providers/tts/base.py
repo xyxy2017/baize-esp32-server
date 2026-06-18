@@ -115,6 +115,9 @@ class TTSProviderBase(ABC):
 
     def handle_opus(self, opus_data: bytes):
         logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
+        metrics = getattr(self.conn, "current_metrics", None)
+        if metrics:
+            metrics.add_opus_frame(opus_data)
         self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, getattr(self, 'current_sentence_id', None)))
 
     def handle_audio_file(self, file_audio: bytes, text):
@@ -127,6 +130,9 @@ class TTSProviderBase(ABC):
         # 使用正则一次性替换，避免重复遍历和部分匹配问题
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
+        metrics = getattr(self.conn, "current_metrics", None)
+        if metrics:
+            metrics.mark("tts_segment_start", chars=len(text or ""))
         max_repeat_time = 5
         if self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
@@ -134,6 +140,9 @@ class TTSProviderBase(ABC):
                 try:
                     audio_bytes = asyncio.run(self.text_to_speak(text, None))
                     if audio_bytes:
+                        if metrics:
+                            metrics.tts_segments += 1
+                            metrics.mark("tts_segment_generated", bytes=len(audio_bytes))
                         # 使用原始文本用于显示/上报
                         self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
                         audio_bytes_to_data_stream(
@@ -177,6 +186,9 @@ class TTSProviderBase(ABC):
                         max_repeat_time -= 1
 
                 if max_repeat_time > 0:
+                    if metrics:
+                        metrics.tts_segments += 1
+                        metrics.mark("tts_segment_generated", file=os.path.basename(tmp_file))
                     logger.bind(tag=TAG).info(
                         f"语音生成成功: {original_text}:{tmp_file}，重试{5 - max_repeat_time}次"
                     )

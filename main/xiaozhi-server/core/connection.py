@@ -43,6 +43,8 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.utils.conversation_metrics import ConversationMetrics
+from core.api.app_demo_store import append_dialogue, clean_baize_text
 
 
 TAG = __name__
@@ -156,6 +158,8 @@ class ConnectionHandler:
         self.asr_audio = []
         self.asr_audio_queue = queue.Queue()
         self.current_speaker = None  # 存储当前说话人
+        self.latest_emotion = "neutral"
+        self.current_metrics = None
 
         # llm相关变量
         self.dialogue = Dialogue()
@@ -215,6 +219,8 @@ class ConnectionHandler:
 
             # 认证通过,继续处理
             self.websocket = ws
+            if self.server and getattr(self.server, "device_registry", None):
+                await self.server.device_registry.register(self)
 
             # 检查是否来自MQTT连接
             request_path = ws.request.path
@@ -257,6 +263,8 @@ class ConnectionHandler:
                 await self._save_and_close(ws)
             except Exception as final_error:
                 self.logger.bind(tag=TAG).error(f"最终清理时出错: {final_error}")
+            if self.server and getattr(self.server, "device_registry", None):
+                await self.server.device_registry.unregister(self)
                 # 确保即使保存记忆失败，也要关闭连接
                 try:
                     await self.close(ws)
@@ -921,6 +929,9 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
+            if self.current_metrics is None:
+                self.current_metrics = ConversationMetrics(current_sentence_id[:8])
+            self.current_metrics.mark("chat_start", text_len=len(query or ""))
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -971,10 +982,14 @@ class ConnectionHandler:
             memory_str = None
             # 仅当query非空（代表用户询问）时查询记忆
             if self.memory is not None and query:
+                if depth == 0 and self.current_metrics:
+                    self.current_metrics.mark("memory_start")
                 future = asyncio.run_coroutine_threadsafe(
                     self.memory.query_memory(query), self.loop
                 )
                 memory_str = future.result()
+                if depth == 0 and self.current_metrics:
+                    self.current_metrics.mark("memory_done")
 
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
@@ -992,7 +1007,17 @@ class ConnectionHandler:
                         memory_str, self.config.get("voiceprint", {})
                     ),
                 )
+            if depth == 0 and self.current_metrics:
+                self.current_metrics.mark(
+                    "llm_request_ready",
+                    memory=bool(memory_str),
+                    function_call=bool(functions),
+                )
         except Exception as e:
+            if depth == 0 and self.current_metrics:
+                self.current_metrics.mark("llm_error", error=type(e).__name__)
+                self.logger.bind(tag=TAG).info(self.current_metrics.format_summary())
+                self.current_metrics = None
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
             return None
 
@@ -1002,6 +1027,8 @@ class ConnectionHandler:
         tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
         content_arguments = ""
         emotion_flag = True
+        emotion_text_buffer = ""
+        first_llm_content = True
         try:
             for response in llm_responses:
                 if self.client_abort:
@@ -1048,28 +1075,46 @@ class ConnectionHandler:
                 else:
                     content = response
 
-                # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
+                # 在 llm 回复开头获取情绪。流式首片段可能很短，所以先攒一小段再判定。
                 if emotion_flag and content is not None and content.strip():
-                    if (self.features or {}).get("emoji", True):
+                    emotion_text_buffer += content
+                    selected_emotion = textUtils.select_baize_emotion(emotion_text_buffer)
+                    plain_emotion_text = textUtils.check_emoji(emotion_text_buffer).strip()
+                    has_explicit_emotion = selected_emotion["emotion"] != "neutral"
+                    has_enough_context = len(plain_emotion_text) >= 12 or any(
+                        mark in plain_emotion_text for mark in ("。", "！", "？", "!", "?")
+                    )
+                    if (self.features or {}).get("emoji", True) and (
+                        has_explicit_emotion or has_enough_context
+                    ):
                         asyncio.run_coroutine_threadsafe(
-                            textUtils.get_emotion(self, content),
+                            textUtils.get_emotion(self, emotion_text_buffer),
                             self.loop,
                         )
-                    emotion_flag = False
+                        emotion_flag = False
+                    elif not (self.features or {}).get("emoji", True):
+                        emotion_flag = False
 
                 if content is not None and len(content) > 0:
+                    if first_llm_content and depth == 0 and self.current_metrics:
+                        self.current_metrics.mark("llm_first_token")
+                        first_llm_content = False
                     if not tool_call_flag:
                         response_message.append(content)
-                        self.tts.tts_text_queue.put(
-                            TTSMessageDTO(
-                                sentence_id=current_sentence_id,
-                                sentence_type=SentenceType.MIDDLE,
-                                content_type=ContentType.TEXT,
-                                content_detail=content,
+                        cleaned_content = clean_baize_text(content)
+                        if cleaned_content:
+                            self.tts.tts_text_queue.put(
+                                TTSMessageDTO(
+                                    sentence_id=current_sentence_id,
+                                    sentence_type=SentenceType.MIDDLE,
+                                    content_type=ContentType.TEXT,
+                                    content_detail=cleaned_content,
+                                )
                             )
-                        )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
+            if depth == 0 and self.current_metrics:
+                self.current_metrics.mark("llm_stream_error", error=type(e).__name__)
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1087,6 +1132,16 @@ class ConnectionHandler:
                     )
                 )
             return
+        if (
+            emotion_flag
+            and emotion_text_buffer.strip()
+            and (self.features or {}).get("emoji", True)
+        ):
+            asyncio.run_coroutine_threadsafe(
+                textUtils.get_emotion(self, emotion_text_buffer),
+                self.loop,
+            )
+            emotion_flag = False
         # 处理function call
         if tool_call_flag:
             bHasError = False
@@ -1149,7 +1204,22 @@ class ConnectionHandler:
                             self.dialogue.put(Message(role="assistant", content=da_response))
 
                     if not real_tool_calls:
+                        app_dialogue_text = "".join(
+                            self._clean_response_garbage(
+                                self._extract_direct_answer_response(
+                                    tc.get("arguments", "{}")
+                                )
+                            )
+                            for tc in direct_answer_calls
+                        )
+                        if depth == 0 and app_dialogue_text:
+                            self._append_app_dialogue(query, app_dialogue_text)
                         if depth == 0:
+                            if self.current_metrics:
+                                self.current_metrics.set_answer(app_dialogue_text)
+                                self.current_metrics.mark(
+                                    "llm_done", assistant_len=len(app_dialogue_text)
+                                )
                             self.tts.tts_text_queue.put(
                                 TTSMessageDTO(
                                     sentence_id=current_sentence_id,
@@ -1169,7 +1239,7 @@ class ConnectionHandler:
                 # LLM 流式阶段已播报过的文本
                 streamed_text = ""
                 if len(response_message) > 0:
-                    streamed_text = "".join(response_message)
+                    streamed_text = clean_baize_text("".join(response_message))
                     self.tts.store_tts_text(current_sentence_id, streamed_text)
                     self.dialogue.put(Message(role="assistant", content=streamed_text))
                 response_message.clear()
@@ -1222,12 +1292,18 @@ class ConnectionHandler:
                     self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text)
 
         # 存储对话内容
+        assistant_text = ""
         if len(response_message) > 0:
-            text_buff = "".join(response_message)
+            text_buff = clean_baize_text("".join(response_message))
+            assistant_text = text_buff
             self.tts.store_tts_text(current_sentence_id, text_buff)
             self.dialogue.put(Message(role="assistant", content=text_buff))
 
         if depth == 0:
+            self._append_app_dialogue(query, assistant_text)
+            if self.current_metrics:
+                self.current_metrics.set_answer(assistant_text)
+                self.current_metrics.mark("llm_done", assistant_len=len(assistant_text))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1243,6 +1319,19 @@ class ConnectionHandler:
             )
 
         return True
+
+    def _append_app_dialogue(self, user_text, assistant_text):
+        try:
+            append_dialogue(
+                self.common_config,
+                source_device_id=self.device_id or "",
+                session_id=self.session_id,
+                user_text=user_text or "",
+                baize_text=assistant_text or "",
+                emotion=getattr(self, "latest_emotion", "neutral") or "neutral",
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"写入 App 对话记录失败: {e}")
 
     def _handle_function_result(self, tool_results, depth, streamed_text=""):
         need_llm_tools = []
@@ -1628,9 +1717,10 @@ class ConnectionHandler:
                 continue
             cleaned.append(line)
         result = '\n'.join(cleaned)
+        result = re.sub(r"^[\s]*(?:[😶🙂😆😂😔😠😭😍😳😲😱🤔😉😎😌🤤😘😏😴😜🙄]\s*)+", "", result)
         # 清理末尾残留的 JSON 闭合符号
         result = re.sub(r'["\'}\]]+$', '', result.rstrip()).rstrip()
-        return result
+        return clean_baize_text(result)
 
     def _merge_tool_calls(self, tool_calls_list, tools_call):
         """合并工具调用列表

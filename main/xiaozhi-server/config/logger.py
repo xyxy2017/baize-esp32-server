@@ -75,6 +75,7 @@ def setup_logging():
         log_level = log_config.get("log_level", "INFO")
         log_dir = log_config.get("log_dir", "tmp")
         log_file = log_config.get("log_file", "server.log")
+        metrics_log_file = log_config.get("metrics_log_file", "conversation_metrics.log")
         data_dir = log_config.get("data_dir", "data")
 
         os.makedirs(log_dir, exist_ok=True)
@@ -103,6 +104,21 @@ def setup_logging():
             enqueue=True,  # 异步安全
             backtrace=True,
             diagnose=True,
+        )
+
+        metrics_log_file_path = os.path.join(log_dir, metrics_log_file)
+        logger.add(
+            metrics_log_file_path,
+            format=log_format_file,
+            level=log_level,
+            filter=lambda record: "[conversation_metrics]" in record["message"],
+            rotation="10 MB",
+            retention="30 days",
+            compression=None,
+            encoding="utf-8",
+            enqueue=True,
+            backtrace=False,
+            diagnose=False,
         )
         _logger_initialized = True  # 标记为已初始化
 

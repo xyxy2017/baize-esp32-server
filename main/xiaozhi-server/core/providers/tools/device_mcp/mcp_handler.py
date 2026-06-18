@@ -6,6 +6,7 @@ import re
 from concurrent.futures import Future
 from core.utils.util import get_vision_url, sanitize_tool_name
 from core.utils.auth import AuthToken
+from core.api.app_demo_store import update_device_report
 from config.logger import setup_logging
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,58 @@ if TYPE_CHECKING:
 
 TAG = __name__
 logger = setup_logging()
+
+
+def _extract_battery_percent(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        percent = int(value)
+        return percent if 0 <= percent <= 100 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                percent = _extract_battery_percent(json.loads(stripped))
+                if percent is not None:
+                    return percent
+            except Exception:
+                pass
+        match = re.search(r"(?:battery|电量|电池)?\D*(\d{1,3})\s*%", value, re.IGNORECASE)
+        if not match:
+            return None
+        percent = int(match.group(1))
+        return percent if 0 <= percent <= 100 else None
+    if isinstance(value, list):
+        for item in value:
+            percent = _extract_battery_percent(item)
+            if percent is not None:
+                return percent
+        return None
+    if isinstance(value, dict):
+        preferred_keys = (
+            "battery_percent",
+            "batteryPercent",
+            "battery",
+            "battery_level",
+            "batteryLevel",
+            "level",
+            "电量",
+            "电池",
+        )
+        for key in preferred_keys:
+            if key in value:
+                percent = _extract_battery_percent(value[key])
+                if percent is not None:
+                    return percent
+        for item in value.values():
+            if isinstance(item, (dict, list, str)):
+                percent = _extract_battery_percent(item)
+                if percent is not None:
+                    return percent
+    return None
 
 
 class MCPClient:
@@ -147,6 +200,13 @@ async def handle_mcp_message(
                 logger.bind(tag=TAG).debug(
                     f"客户端MCP服务器信息: name={name}, version={version}"
                 )
+                update_device_report(
+                    conn.config,
+                    source_device_id=getattr(conn, "device_id", "") or "",
+                    client_id=getattr(conn, "headers", {}).get("client-id", ""),
+                    model=name or "",
+                    firmware_version=version or "",
+                )
 
             await asyncio.sleep(1)
             logger.bind(tag=TAG).debug("初始化完成，开始请求MCP工具列表")
@@ -211,6 +271,7 @@ async def handle_mcp_message(
                 else:
                     await mcp_client.set_ready(True)
                     logger.bind(tag=TAG).debug("所有工具已获取，MCP客户端准备就绪")
+                    asyncio.create_task(_refresh_device_status_report(conn, mcp_client))
 
                     # 刷新工具缓存，确保MCP工具被包含在函数列表中
                     if hasattr(conn, "func_handler") and conn.func_handler:
@@ -291,6 +352,26 @@ async def send_mcp_tools_list_continue_request(conn: "ConnectionHandler", cursor
     }
     logger.bind(tag=TAG).info(f"发送带cursor的MCP工具列表请求: {cursor}")
     await send_mcp_message(conn, payload)
+
+
+async def _refresh_device_status_report(conn: "ConnectionHandler", mcp_client: MCPClient):
+    tool_name = "self_get_device_status"
+    if not mcp_client.has_tool(tool_name):
+        return
+
+    try:
+        result = await call_mcp_tool(conn, mcp_client, tool_name, "{}", timeout=5)
+        battery_percent = _extract_battery_percent(result)
+        if battery_percent is None:
+            return
+        update_device_report(
+            conn.config,
+            source_device_id=getattr(conn, "device_id", "") or "",
+            client_id=getattr(conn, "headers", {}).get("client-id", ""),
+            battery_percent=battery_percent,
+        )
+    except Exception as e:
+        logger.bind(tag=TAG).warning(f"刷新设备状态失败: {e}")
 
 
 async def call_mcp_tool(

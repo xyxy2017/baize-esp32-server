@@ -8,6 +8,7 @@ from config.logger import setup_logging
 from core.utils.util import get_local_ip, validate_mcp_endpoint
 from core.http_server import SimpleHttpServer
 from core.websocket_server import WebSocketServer
+from core.device_registry import DeviceConnectionRegistry
 from core.utils.util import check_ffmpeg_installed
 from core.utils.gc_manager import get_gc_manager
 
@@ -69,10 +70,11 @@ async def main():
     await gc_manager.start()
 
     # 启动 WebSocket 服务器
-    ws_server = WebSocketServer(config)
+    device_registry = DeviceConnectionRegistry()
+    ws_server = WebSocketServer(config, device_registry=device_registry)
     ws_task = asyncio.create_task(ws_server.start())
     # 启动 Simple http 服务器
-    ota_server = SimpleHttpServer(config)
+    ota_server = SimpleHttpServer(config, device_registry=device_registry)
     ota_task = asyncio.create_task(ota_server.start())
 
     read_config_from_api = config.get("read_config_from_api", False)
