@@ -44,7 +44,7 @@ from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
 from core.utils.conversation_metrics import ConversationMetrics
-from core.api.app_demo_store import append_dialogue, clean_baize_text
+from core.api.app_demo_store import append_dialogue, clean_baize_text, consume_energy, resolve_bound_app_device, user_summary
 
 
 TAG = __name__
@@ -940,6 +940,24 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
+            if not self._app_has_energy_for_voice_dialogue():
+                energy_reply = "白泽今天的陪伴精力不够了，明天恢复后再继续陪你聊。"
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=current_sentence_id,
+                        sentence_type=SentenceType.FIRST,
+                        content_type=ContentType.TEXT,
+                        content_detail=energy_reply,
+                    )
+                )
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=current_sentence_id,
+                        sentence_type=SentenceType.LAST,
+                        content_type=ContentType.ACTION,
+                    )
+                )
+                return False
         else:
             # 递归调用时，使用当前的sentence_id
             current_sentence_id = self.sentence_id
@@ -1322,6 +1340,12 @@ class ConnectionHandler:
 
     def _append_app_dialogue(self, user_text, assistant_text):
         try:
+            app_device = self._resolve_app_device()
+            if not app_device:
+                return
+            if not consume_energy(self.common_config, app_device["user_id"], app_device["id"], 1, "voice_dialogue"):
+                self.logger.bind(tag=TAG).warning("App user energy is not enough; skip dialogue persistence")
+                return
             append_dialogue(
                 self.common_config,
                 source_device_id=self.device_id or "",
@@ -1329,9 +1353,32 @@ class ConnectionHandler:
                 user_text=user_text or "",
                 baize_text=assistant_text or "",
                 emotion=getattr(self, "latest_emotion", "neutral") or "neutral",
+                user_id=app_device["user_id"],
+                device_id=app_device["id"],
             )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"写入 App 对话记录失败: {e}")
+
+    def _resolve_app_device(self):
+        source_device_id = self.device_id or ""
+        client_id = ""
+        if self.headers is not None:
+            client_id = self.headers.get("client-id", "") or self.headers.get("client_id", "") or ""
+        return resolve_bound_app_device(
+            self.common_config,
+            source_device_id=source_device_id,
+            client_id=client_id,
+            device_id=source_device_id,
+        )
+
+    def _app_has_energy_for_voice_dialogue(self) -> bool:
+        app_device = self._resolve_app_device()
+        if not app_device:
+            return True
+        try:
+            return user_summary(self.common_config, app_device["user_id"])["energy"]["current"] >= 1
+        except Exception:
+            return True
 
     def _handle_function_result(self, tool_results, depth, streamed_text=""):
         need_llm_tools = []

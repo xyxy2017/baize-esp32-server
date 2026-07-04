@@ -14,19 +14,29 @@ from core.api.app_demo_store import (
     bound_device,
     clean_baize_text,
     consume_energy,
+    create_device,
     delete_memory,
     generate_diary,
     get_settings,
+    list_admin_conversations,
+    list_admin_devices,
     list_devices,
     list_dialogues,
     list_diaries,
+    list_energy_events,
+    list_intimacy_events,
     list_memories,
     load_state,
+    login_phone_user,
     ota_payload,
+    register_phone_user,
     register_or_login_user,
+    rotate_device_code,
     state_path_from_config,
     unbind_device,
     update_device_name,
+    update_user_password,
+    upsert_memory,
     update_settings,
     user_for_token,
     user_summary,
@@ -64,7 +74,14 @@ class AppDemoHandler(BaseHandler):
             web.post("/api/app/login", self.handle_login),
             web.post("/api/app/demo-login", self.handle_demo_login),
             web.get("/api/app/me", self.handle_me),
+            web.post("/api/app/me/password", self.handle_update_password),
             web.get("/api/app/admin/metrics", self.handle_admin_metrics),
+            web.get("/api/app/admin/conversations", self.handle_admin_conversations),
+            web.get("/api/app/admin/energy-events", self.handle_admin_energy_events),
+            web.get("/api/app/admin/intimacy-events", self.handle_admin_intimacy_events),
+            web.get("/api/app/admin/devices", self.handle_admin_devices),
+            web.post("/api/app/admin/devices", self.handle_admin_create_device),
+            web.post("/api/app/admin/devices/{device_id}/rotate-code", self.handle_admin_rotate_device_code),
             web.get("/api/app/devices", self.handle_devices),
             web.post("/api/app/devices/bind", self.handle_bind_device),
             web.get("/api/app/devices/{device_id}", self.handle_device_detail),
@@ -72,6 +89,8 @@ class AppDemoHandler(BaseHandler):
             web.get("/api/app/devices/{device_id}/settings", self.handle_device_settings),
             web.put("/api/app/devices/{device_id}/settings", self.handle_update_settings),
             web.get("/api/app/devices/{device_id}/memories", self.handle_memories),
+            web.post("/api/app/devices/{device_id}/memories", self.handle_create_memory),
+            web.put("/api/app/devices/{device_id}/memories/{memory_id}", self.handle_update_memory),
             web.delete("/api/app/devices/{device_id}/memories/{memory_id}", self.handle_delete_memory),
             web.post("/api/app/devices/{device_id}/debug/chat", self.handle_debug_chat),
             web.get("/api/app/devices/{device_id}/connection", self.handle_connection_diagnostic),
@@ -92,13 +111,39 @@ class AppDemoHandler(BaseHandler):
         return response
 
     async def handle_register(self, request):
-        return await self._handle_invite_auth(request)
+        payload = await self._read_json(request)
+        if payload.get("phone") is None:
+            return await self._handle_invite_auth_payload(payload)
+        try:
+            result = register_phone_user(
+                self.config,
+                phone=str(payload.get("phone", "")).strip(),
+                password=str(payload.get("password", "")),
+                nickname=str(payload.get("nickname", "")).strip(),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        return self._json_response(result)
 
     async def handle_login(self, request):
-        return await self._handle_invite_auth(request)
+        payload = await self._read_json(request)
+        if payload.get("phone") is None:
+            return await self._handle_invite_auth_payload(payload)
+        try:
+            result = login_phone_user(
+                self.config,
+                phone=str(payload.get("phone", "")).strip(),
+                password=str(payload.get("password", "")),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=401)
+        return self._json_response(result)
 
     async def _handle_invite_auth(self, request):
         payload = await self._read_json(request)
+        return await self._handle_invite_auth_payload(payload)
+
+    async def _handle_invite_auth_payload(self, payload):
         try:
             result = register_or_login_user(
                 self.config,
@@ -125,11 +170,89 @@ class AppDemoHandler(BaseHandler):
             return self._error_response("未登录或 token 无效", status=401)
         return self._json_response(user_summary(self.config, user["id"]))
 
+    async def handle_update_password(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        payload = await self._read_json(request)
+        try:
+            updated = update_user_password(
+                self.config,
+                user["id"],
+                old_password=str(payload.get("old_password", "")),
+                new_password=str(payload.get("new_password", "")),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not updated:
+            return self._error_response("旧密码错误", status=403)
+        return self._json_response({"updated": True})
+
     async def handle_admin_metrics(self, request):
         user = self._current_user(request)
         if not user:
             return self._error_response("未登录或 token 无效", status=401)
         return self._json_response(admin_metrics(self.config))
+
+    async def handle_admin_conversations(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        return self._json_response({"items": list_admin_conversations(self.config, self._limit(request))})
+
+    async def handle_admin_energy_events(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        return self._json_response({"items": list_energy_events(self.config, self._limit(request))})
+
+    async def handle_admin_intimacy_events(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        return self._json_response({"items": list_intimacy_events(self.config, self._limit(request))})
+
+    async def handle_admin_devices(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        return self._json_response({"items": list_admin_devices(self.config)})
+
+    async def handle_admin_create_device(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        payload = await self._read_json(request)
+        try:
+            device = create_device(
+                self.config,
+                device_code=str(payload.get("device_code", "")).strip() or None,
+                display_name=str(payload.get("display_name", "")).strip() or None,
+                source_device_id=str(payload.get("source_device_id", "")).strip() or None,
+                client_id=str(payload.get("client_id", "")).strip() or None,
+                model=str(payload.get("model", "")).strip() or None,
+                firmware_version=str(payload.get("firmware_version", "")).strip() or None,
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        return self._json_response(device)
+
+    async def handle_admin_rotate_device_code(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        payload = await self._read_json(request)
+        try:
+            device = rotate_device_code(
+                self.config,
+                request.match_info["device_id"],
+                str(payload.get("device_code", "")).strip() or None,
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not device:
+            return self._error_response("设备不存在", status=404)
+        return self._json_response(device)
 
     async def handle_devices(self, request):
         user = self._current_user(request)
@@ -145,7 +268,10 @@ class AppDemoHandler(BaseHandler):
         device_code = str(payload.get("device_code", "")).strip()
         if not device_code:
             return self._error_response("device_code 不能为空", status=400)
-        device = bind_device(self.config, user["id"], device_code)
+        try:
+            device = bind_device(self.config, user["id"], device_code)
+        except ValueError as e:
+            return self._error_response(str(e), status=409)
         if not device:
             return self._error_response("设备码不存在", status=404)
         return self._json_response(self._device_payload(device))
@@ -195,6 +321,45 @@ class AppDemoHandler(BaseHandler):
         if isinstance(device_or_response, web.Response):
             return device_or_response
         return self._json_response({"items": list_memories(self.config, user["id"], device_or_response["id"]) or []})
+
+    async def handle_create_memory(self, request):
+        user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+        payload = await self._read_json(request)
+        try:
+            memory = upsert_memory(
+                self.config,
+                user["id"],
+                device_or_response["id"],
+                str(payload.get("category", "note")).strip(),
+                str(payload.get("content", "")).strip(),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not memory:
+            return self._error_response("设备不存在或未绑定", status=404)
+        return self._json_response(memory)
+
+    async def handle_update_memory(self, request):
+        user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+        payload = await self._read_json(request)
+        try:
+            memory = upsert_memory(
+                self.config,
+                user["id"],
+                device_or_response["id"],
+                str(payload.get("category", "note")).strip(),
+                str(payload.get("content", "")).strip(),
+                memory_id=request.match_info["memory_id"],
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not memory:
+            return self._error_response("记忆不存在", status=404)
+        return self._json_response(memory)
 
     async def handle_delete_memory(self, request):
         user, device_or_response = self._get_bound_device_or_response(request)
@@ -452,6 +617,12 @@ class AppDemoHandler(BaseHandler):
         prompt_manager.update_context_info(SimpleNamespace(device_id=device_id), None)
         quick_prompt = prompt_manager.get_quick_prompt(user_prompt)
         return prompt_manager.build_enhanced_prompt(quick_prompt, device_id, None, emoji_enabled=True) or quick_prompt
+
+    def _limit(self, request, default: int = 100) -> int:
+        try:
+            return max(1, min(int(request.query.get("limit", default)), 500))
+        except Exception:
+            return default
 
     def _json_response(self, payload: Dict[str, Any], status: int = 200) -> web.Response:
         response = web.Response(

@@ -29,6 +29,7 @@ class _NoopLogger:
 
 logger_module.setup_logging = lambda: _NoopLogger()
 sys.modules.setdefault("config.logger", logger_module)
+sys.modules.setdefault("opuslib_next", types.ModuleType("opuslib_next"))
 
 from core.api.app_demo_store import load_state
 from core.providers.tools.device_mcp.mcp_handler import (

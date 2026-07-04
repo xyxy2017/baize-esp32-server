@@ -30,6 +30,7 @@ class _NoopLogger:
 
 logger_module.setup_logging = lambda: _NoopLogger()
 sys.modules.setdefault("config.logger", logger_module)
+sys.modules.setdefault("opuslib_next", types.ModuleType("opuslib_next"))
 
 from core.api.app_demo_handler import AppDemoHandler, DEMO_TOKEN
 from core.api.ota_handler import OTAHandler
@@ -274,6 +275,166 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             "/api/app/devices/baize_dev_001", headers=bob_headers
         )
         self.assertEqual(bob_detail.status, 404)
+
+    @unittest_run_loop
+    async def test_phone_register_login_and_password_update(self):
+        register_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138000", "password": "secret1"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(register_response.status, 200)
+        register_payload = await register_response.json()
+        self.assertEqual(register_payload["user"]["phone"], "13800138000")
+        self.assertEqual(register_payload["user"]["nickname"], "138****8000")
+        token = register_payload["token"]
+
+        duplicate_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138000", "password": "secret1"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(duplicate_response.status, 400)
+
+        bad_phone_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "123", "password": "secret1"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(bad_phone_response.status, 400)
+
+        short_password_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13900139000", "password": "123"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(short_password_response.status, 400)
+
+        wrong_login_response = await self.client.post(
+            "/api/app/login",
+            data=json.dumps({"phone": "13800138000", "password": "wrongxx"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(wrong_login_response.status, 401)
+
+        login_response = await self.client.post(
+            "/api/app/login",
+            data=json.dumps({"phone": "13800138000", "password": "secret1"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(login_response.status, 200)
+        login_payload = await login_response.json()
+        self.assertIn("energy", await (await self.client.get("/api/app/me", headers={"Authorization": f"Bearer {login_payload['token']}"})).json())
+
+        update_response = await self.client.post(
+            "/api/app/me/password",
+            data=json.dumps({"old_password": "secret1", "new_password": "secret2"}),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        self.assertEqual(update_response.status, 200)
+
+        old_login_response = await self.client.post(
+            "/api/app/login",
+            data=json.dumps({"phone": "13800138000", "password": "secret1"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(old_login_response.status, 401)
+
+        new_login_response = await self.client.post(
+            "/api/app/login",
+            data=json.dumps({"phone": "13800138000", "password": "secret2"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(new_login_response.status, 200)
+
+    @unittest_run_loop
+    async def test_admin_device_management_and_unique_device_binding(self):
+        alice_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138001", "password": "secret1", "nickname": "Alice"}),
+            headers={"Content-Type": "application/json"},
+        )
+        alice_token = (await alice_response.json())["token"]
+        alice_headers = {"Authorization": f"Bearer {alice_token}", "Content-Type": "application/json"}
+
+        create_response = await self.client.post(
+            "/api/app/admin/devices",
+            data=json.dumps({"device_code": "654321", "display_name": "Office Baize"}),
+            headers=alice_headers,
+        )
+        self.assertEqual(create_response.status, 200)
+        device = await create_response.json()
+        self.assertEqual(device["device_code"], "654321")
+
+        bind_response = await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": "654321"}),
+            headers=alice_headers,
+        )
+        self.assertEqual(bind_response.status, 200)
+
+        bob_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138002", "password": "secret1", "nickname": "Bob"}),
+            headers={"Content-Type": "application/json"},
+        )
+        bob_token = (await bob_response.json())["token"]
+        bob_bind_response = await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": "654321"}),
+            headers={"Authorization": f"Bearer {bob_token}", "Content-Type": "application/json"},
+        )
+        self.assertEqual(bob_bind_response.status, 409)
+
+        rotate_response = await self.client.post(
+            f"/api/app/admin/devices/{device['id']}/rotate-code",
+            data=json.dumps({"device_code": "654322"}),
+            headers=alice_headers,
+        )
+        self.assertEqual(rotate_response.status, 200)
+        self.assertEqual((await rotate_response.json())["device_code"], "654322")
+
+        list_response = await self.client.get("/api/app/admin/devices", headers={"Authorization": f"Bearer {alice_token}"})
+        self.assertEqual(list_response.status, 200)
+        self.assertTrue(any(item["id"] == device["id"] for item in (await list_response.json())["items"]))
+
+    @unittest_run_loop
+    async def test_memory_create_update_and_admin_event_lists(self):
+        await self.bind_demo_device()
+        create_memory_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/memories",
+            data=json.dumps({"category": "preference", "content": "我喜欢晚上聊天"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(create_memory_response.status, 200)
+        memory = await create_memory_response.json()
+
+        update_memory_response = await self.client.put(
+            f"/api/app/devices/baize_dev_001/memories/{memory['id']}",
+            data=json.dumps({"category": "preference", "content": "我喜欢睡前聊天"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(update_memory_response.status, 200)
+        self.assertEqual((await update_memory_response.json())["content"], "我喜欢睡前聊天")
+
+        chat_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/debug/chat",
+            data=json.dumps({"text": "今天我完成了演示，很开心"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(chat_response.status, 200)
+
+        conversations_response = await self.client.get("/api/app/admin/conversations", headers=self.auth_headers())
+        self.assertEqual(conversations_response.status, 200)
+        self.assertGreaterEqual(len((await conversations_response.json())["items"]), 1)
+
+        energy_response = await self.client.get("/api/app/admin/energy-events", headers=self.auth_headers())
+        self.assertEqual(energy_response.status, 200)
+        self.assertGreaterEqual(len((await energy_response.json())["items"]), 1)
+
+        intimacy_response = await self.client.get("/api/app/admin/intimacy-events", headers=self.auth_headers())
+        self.assertEqual(intimacy_response.status, 200)
+        self.assertGreaterEqual(len((await intimacy_response.json())["items"]), 1)
 
     @unittest_run_loop
     async def test_device_detail_marks_stale_online_state_offline_without_active_connection(self):
@@ -847,7 +1008,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertIn("小白泽", llm_instance.calls[0]["system_prompt"])
         self.assertIn("小伙伴", llm_instance.calls[0]["system_prompt"])
         self.assertIn("gentle", llm_instance.calls[0]["system_prompt"])
-        self.assertIn("DEVICE=baize_dev_001", llm_instance.calls[0]["system_prompt"])
+        self.assertIn("<app_device_settings>", llm_instance.calls[0]["system_prompt"])
         self.assertNotIn("小智/小志", llm_instance.calls[0]["system_prompt"])
         self.assertNotIn("称呼用户为主人", llm_instance.calls[0]["system_prompt"])
 

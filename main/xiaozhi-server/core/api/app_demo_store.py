@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import hashlib
+import hmac
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,8 @@ DEMO_DEVICE_ID = "baize_dev_001"
 DEFAULT_INVITE_CODE = "BAIZE-MVP"
 INITIAL_ENERGY = 30
 DAILY_ENERGY_LIMIT = 30
+PASSWORD_MIN_LENGTH = 6
+PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
 
 MVP_EMOTIONS = {"neutral", "happy", "thinking", "surprised", "sad", "sleepy", "confused"}
 EMOTION_ALIASES = {
@@ -279,7 +283,76 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _migrate_schema(conn)
     conn.commit()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    user_columns = _table_columns(conn, "users")
+    if "phone" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+    if "password_hash" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    if "password_updated_at" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN password_updated_at TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL AND phone != ''")
+    conn.execute(
+        """
+        DELETE FROM user_device_bindings
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM user_device_bindings GROUP BY device_id
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_device_unique ON user_device_bindings(device_id)")
+
+
+def normalize_phone(phone: str | None) -> str:
+    return re.sub(r"\D", "", phone or "")
+
+
+def mask_phone(phone: str) -> str:
+    phone = normalize_phone(phone)
+    if len(phone) < 7:
+        return phone
+    return f"{phone[:3]}****{phone[-4:]}"
+
+
+def validate_phone(phone: str) -> str:
+    phone = normalize_phone(phone)
+    if not PHONE_PATTERN.match(phone):
+        raise ValueError("phone 格式不正确")
+    return phone
+
+
+def _validate_password(password: str) -> str:
+    password = password or ""
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"password 至少 {PASSWORD_MIN_LENGTH} 位")
+    return password
+
+
+def _hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or uuid.uuid4().hex
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000)
+    return f"pbkdf2_sha256${salt}${digest.hex()}"
+
+
+def _verify_password(password: str, password_hash: str | None) -> bool:
+    if not password_hash:
+        return False
+    try:
+        algorithm, salt, expected = password_hash.split("$", 2)
+    except ValueError:
+        return False
+    if algorithm != "pbkdf2_sha256":
+        return False
+    actual = _hash_password(password, salt).split("$", 2)[2]
+    return hmac.compare_digest(actual, expected)
 
 
 def ensure_db(db_path: str) -> None:
@@ -334,10 +407,13 @@ def _ensure_demo_seed(conn: sqlite3.Connection) -> None:
 
 
 def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
+    phone = row["phone"] if "phone" in row.keys() else None
     return {
         "id": row["id"],
         "nickname": row["nickname"],
         "display_name": row["nickname"],
+        "phone": phone,
+        "masked_phone": mask_phone(phone) if phone else None,
         "login_type": row["login_type"],
         "invite_code": row["invite_code"],
         "created_at": row["created_at"],
@@ -540,6 +616,82 @@ def register_or_login_user(config: dict, invite_code: str, nickname: str) -> Dic
     return {"token": token, "expires_at": expires_at, "user": user}
 
 
+def _issue_token(conn: sqlite3.Connection, user_id: str, now: str | None = None) -> tuple[str, str]:
+    now = now or now_iso()
+    token = f"mvp_{uuid.uuid4().hex}"
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).replace(microsecond=0).isoformat()
+    conn.execute(
+        "INSERT INTO auth_tokens(token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (token, user_id, now, expires_at),
+    )
+    return token, expires_at
+
+
+def register_phone_user(config: dict, phone: str, password: str, nickname: str = "") -> Dict[str, Any]:
+    phone = validate_phone(phone)
+    password = _validate_password(password)
+    nickname = (nickname or "").strip() or mask_phone(phone)
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    now = now_iso()
+    with _connect(db_path) as conn:
+        exists = conn.execute("SELECT 1 FROM users WHERE phone = ?", (phone,)).fetchone()
+        if exists:
+            raise ValueError("phone 已注册")
+        user_id = f"user_{uuid.uuid4().hex}"
+        conn.execute(
+            """
+            INSERT INTO users(
+                id, nickname, login_type, invite_code, phone, password_hash,
+                password_updated_at, created_at, last_login_at
+            ) VALUES (?, ?, 'phone_password', '', ?, ?, ?, ?, ?)
+            """,
+            (user_id, nickname, phone, _hash_password(password), now, now, now),
+        )
+        _ensure_energy(conn, user_id)
+        token, expires_at = _issue_token(conn, user_id, now)
+        conn.commit()
+        user = _row_to_user(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
+    return {"token": token, "expires_at": expires_at, "user": user}
+
+
+def login_phone_user(config: dict, phone: str, password: str) -> Dict[str, Any]:
+    phone = validate_phone(phone)
+    password = _validate_password(password)
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    now = now_iso()
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
+        if row is None or not _verify_password(password, row["password_hash"]):
+            raise ValueError("手机号或密码错误")
+        conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, row["id"]))
+        _ensure_energy(conn, row["id"])
+        token, expires_at = _issue_token(conn, row["id"], now)
+        conn.commit()
+        user = _row_to_user(conn.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone())
+    return {"token": token, "expires_at": expires_at, "user": user}
+
+
+def update_user_password(config: dict, user_id: str, old_password: str | None, new_password: str) -> bool:
+    new_password = _validate_password(new_password)
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            return False
+        if row["password_hash"] and not _verify_password(old_password or "", row["password_hash"]):
+            return False
+        now = now_iso()
+        conn.execute(
+            "UPDATE users SET password_hash = ?, password_updated_at = ?, login_type = 'phone_password' WHERE id = ?",
+            (_hash_password(new_password), now, user_id),
+        )
+        conn.commit()
+    return True
+
+
 def user_for_token(config: dict, token: str) -> Dict[str, Any] | None:
     if not token:
         return None
@@ -604,6 +756,9 @@ def bind_device(config: dict, user_id: str, device_code: str) -> Dict[str, Any] 
         row = conn.execute("SELECT * FROM devices WHERE device_code = ?", (device_code,)).fetchone()
         if row is None:
             return None
+        owner = conn.execute("SELECT user_id FROM user_device_bindings WHERE device_id = ?", (row["id"],)).fetchone()
+        if owner is not None and owner["user_id"] != user_id:
+            raise ValueError("device already bound")
         conn.execute(
             "INSERT OR IGNORE INTO user_device_bindings(user_id, device_id, bound_at) VALUES (?, ?, ?)",
             (user_id, row["id"], now_iso()),
@@ -611,6 +766,96 @@ def bind_device(config: dict, user_id: str, device_code: str) -> Dict[str, Any] 
         _ensure_intimacy(conn, user_id, row["id"])
         conn.commit()
         return device_payload(row)
+
+
+def create_device(
+    config: dict,
+    device_code: str | None = None,
+    display_name: str | None = None,
+    source_device_id: str | None = None,
+    client_id: str | None = None,
+    model: str | None = None,
+    firmware_version: str | None = None,
+) -> Dict[str, Any]:
+    device_code = (device_code or str(uuid.uuid4().int)[0:6]).strip()
+    if not device_code:
+        raise ValueError("device_code 不能为空")
+    display_name = (display_name or "我的白泽").strip()
+    device_id = f"baize_{uuid.uuid4().hex[:12]}"
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        if conn.execute("SELECT 1 FROM devices WHERE device_code = ?", (device_code,)).fetchone():
+            raise ValueError("device_code 已存在")
+        version = (firmware_version or "0.1.0-demo").strip()
+        conn.execute(
+            """
+            INSERT INTO devices(
+                id, device_code, display_name, source_device_id, client_id, model,
+                online_status, firmware_version, current_version, latest_version,
+                update_available, release_note
+            ) VALUES (?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, 0, ?)
+            """,
+            (
+                device_id,
+                device_code,
+                display_name,
+                (source_device_id or "").strip() or None,
+                (client_id or "").strip() or None,
+                (model or "").strip() or None,
+                version,
+                version,
+                version,
+                f"设备当前版本 {version}",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO device_settings(device_id, baize_nickname, user_call_name, personality_mode, tts_voice)
+            VALUES (?, '白泽', '小伙伴', 'curious', 'Sambert 知颖')
+            """,
+            (device_id,),
+        )
+        conn.commit()
+        return device_payload(conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone())
+
+
+def list_admin_devices(config: dict) -> list[Dict[str, Any]]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT d.*, b.user_id AS bound_user_id, b.bound_at
+            FROM devices d
+            LEFT JOIN user_device_bindings b ON b.device_id = d.id
+            ORDER BY d.id
+            """
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = device_payload(row)
+            item["bound_user_id"] = row["bound_user_id"]
+            item["bound_at"] = row["bound_at"]
+            items.append(item)
+        return items
+
+
+def rotate_device_code(config: dict, device_id: str, device_code: str | None = None) -> Dict[str, Any] | None:
+    new_code = (device_code or str(uuid.uuid4().int)[0:6]).strip()
+    if not new_code:
+        raise ValueError("device_code 不能为空")
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        if conn.execute("SELECT 1 FROM devices WHERE device_code = ? AND id != ?", (new_code, device_id)).fetchone():
+            raise ValueError("device_code 已存在")
+        row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("UPDATE devices SET device_code = ? WHERE id = ?", (new_code, device_id))
+        conn.commit()
+        return device_payload(conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone())
 
 
 def bound_device(config: dict, user_id: str, device_id: str) -> Dict[str, Any] | None:
@@ -731,6 +976,35 @@ def _device_id_for_source(conn: sqlite3.Connection, source_device_id: str) -> st
     return DEMO_DEVICE_ID
 
 
+def resolve_bound_app_device(
+    config: dict,
+    source_device_id: str = "",
+    client_id: str = "",
+    device_id: str = "",
+) -> Dict[str, Any] | None:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    source_device_id = source_device_id or ""
+    client_id = client_id or ""
+    device_id = device_id or ""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT d.*, b.user_id
+            FROM devices d
+            JOIN user_device_bindings b ON b.device_id = d.id
+            WHERE d.id = ? OR d.source_device_id = ? OR d.client_id = ? OR d.source_device_id = ? OR d.client_id = ?
+            ORDER BY b.bound_at LIMIT 1
+            """,
+            (device_id, source_device_id, source_device_id, client_id, client_id),
+        ).fetchone()
+        if not row:
+            return None
+        payload = device_payload(row)
+        payload["user_id"] = row["user_id"]
+        return payload
+
+
 def append_dialogue(
     config: dict,
     source_device_id: str,
@@ -781,6 +1055,7 @@ def append_dialogue(
         )
         conn.commit()
     record_dialogue_intimacy(config, user_id, device_id)
+    extract_memories_from_dialogue(config, user_id, device_id, user_text, baize_text)
     return item
 
 
@@ -955,6 +1230,89 @@ def list_memories(config: dict, user_id: str, device_id: str) -> list[Dict[str, 
         return [dict(row) for row in rows]
 
 
+def upsert_memory(
+    config: dict,
+    user_id: str,
+    device_id: str,
+    category: str,
+    content: str,
+    memory_id: str | None = None,
+) -> Dict[str, Any] | None:
+    category = (category or "note").strip()
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("content 不能为空")
+    if category not in {"preference", "nickname", "event", "emotion", "note"}:
+        category = "note"
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        if not _is_bound_conn(conn, user_id, device_id):
+            return None
+        now = now_iso()
+        if memory_id:
+            cur = conn.execute(
+                """
+                UPDATE memories SET category = ?, content = ?
+                WHERE id = ? AND user_id = ? AND device_id = ? AND disabled_at IS NULL
+                """,
+                (category, content, memory_id, user_id, device_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        else:
+            duplicate = conn.execute(
+                """
+                SELECT id FROM memories
+                WHERE user_id = ? AND device_id = ? AND category = ? AND content = ? AND disabled_at IS NULL
+                """,
+                (user_id, device_id, category, content),
+            ).fetchone()
+            memory_id = duplicate["id"] if duplicate else f"mem_{uuid.uuid4().hex}"
+            if duplicate is None:
+                conn.execute(
+                    "INSERT INTO memories(id, user_id, device_id, category, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (memory_id, user_id, device_id, category, content, now),
+                )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, category, content, created_at FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def extract_memories_from_dialogue(
+    config: dict,
+    user_id: str,
+    device_id: str,
+    user_text: str,
+    baize_text: str = "",
+) -> list[Dict[str, Any]]:
+    text = (user_text or "").strip()
+    if not text:
+        return []
+    candidates: list[tuple[str, str]] = []
+    lowered = text.lower()
+    if any(word in text for word in ("喜欢", "爱吃", "想要", "偏好")) or any(word in lowered for word in ("like", "love", "prefer")):
+        candidates.append(("preference", text[:120]))
+    if any(word in text for word in ("叫我", "称呼我", "我的名字", "我叫")):
+        candidates.append(("nickname", text[:120]))
+    if any(word in text for word in ("今天", "明天", "昨天", "完成", "去了", "遇到", "考试", "工作")):
+        candidates.append(("event", text[:120]))
+    if any(word in text for word in ("开心", "难过", "紧张", "生气", "害怕", "累", "焦虑")):
+        candidates.append(("emotion", text[:120]))
+    memories = []
+    for category, content in candidates[:2]:
+        try:
+            memory = upsert_memory(config, user_id, device_id, category, content)
+            if memory:
+                memories.append(memory)
+        except Exception:
+            continue
+    return memories
+
+
 def delete_memory(config: dict, user_id: str, device_id: str, memory_id: str) -> bool | None:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
@@ -1076,6 +1434,55 @@ def update_ota_report(config: dict, current_version: str, latest_version: str, u
         }
 
 
+def list_energy_events(config: dict, limit: int = 100) -> list[Dict[str, Any]]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, u.phone, u.nickname
+            FROM energy_events e
+            LEFT JOIN users u ON u.id = e.user_id
+            ORDER BY e.created_at DESC LIMIT ?
+            """,
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_intimacy_events(config: dict, limit: int = 100) -> list[Dict[str, Any]]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, u.phone, u.nickname
+            FROM intimacy_events e
+            LEFT JOIN users u ON u.id = e.user_id
+            ORDER BY e.created_at DESC LIMIT ?
+            """,
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_admin_conversations(config: dict, limit: int = 100) -> list[Dict[str, Any]]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT d.*, u.phone, u.nickname, dev.display_name
+            FROM dialogues d
+            LEFT JOIN users u ON u.id = d.user_id
+            LEFT JOIN devices dev ON dev.id = d.device_id
+            ORDER BY d.created_at DESC LIMIT ?
+            """,
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def admin_metrics(config: dict) -> Dict[str, Any]:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
@@ -1090,6 +1497,7 @@ def admin_metrics(config: dict) -> Dict[str, Any]:
                 row["emotion"]: row["c"]
                 for row in conn.execute("SELECT emotion, COUNT(*) AS c FROM emotion_stats GROUP BY emotion").fetchall()
             },
+            "phone_users": conn.execute("SELECT COUNT(*) AS c FROM users WHERE phone IS NOT NULL AND phone != ''").fetchone()["c"],
         }
 
 
@@ -1109,6 +1517,20 @@ def prompt_context_for_device(config: dict, device_identifier: str) -> str:
             conn.execute("SELECT * FROM device_settings WHERE device_id = ?", (device["id"],)).fetchone(),
             device["id"],
         )
+        memories = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT category, content FROM memories
+                WHERE device_id = ? AND disabled_at IS NULL
+                ORDER BY created_at DESC LIMIT 8
+                """,
+                (device["id"],),
+            ).fetchall()
+        ]
+    memory_context = "\n".join(f"- {item['category']}: {item['content']}" for item in memories)
+    if memory_context:
+        settings["tts_voice"] = f"{settings['tts_voice']}\n记忆：\n{memory_context}"
     return "\n".join(
         [
             "",
