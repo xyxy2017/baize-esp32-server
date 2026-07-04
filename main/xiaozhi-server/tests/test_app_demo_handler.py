@@ -745,8 +745,19 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         diary = await generate_response.json()
         self.assertEqual(diary["dialogue_count"], 2)
         self.assertEqual(diary["primary_emotion"], "happy")
+        self.assertEqual(diary["title"], "今天是个好日子哦")
         self.assertIn("完成了演示", diary["summary"])
         self.assertIn("有点紧张", diary["summary"])
+        self.assertIn("我陪", diary["summary"])
+        self.assertIn("后来", diary["summary"])
+        self.assertIn("现在", diary["summary"])
+        self.assertIn("\n\n", diary["summary"])
+        self.assertNotIn("“", diary["summary"])
+        self.assertNotIn("”", diary["summary"])
+        self.assertNotIn("你说", diary["summary"])
+        self.assertNotIn("回应过", diary["summary"])
+        self.assertNotIn("白泽回应", diary["summary"])
+        self.assertIn("今天我记得", diary["baize_note"])
         self.assertEqual(len(diary["quotes"]), 2)
 
         list_response = await self.client.get(
@@ -755,6 +766,47 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(list_response.status, 200)
         payload = await list_response.json()
         self.assertEqual(payload["items"][0]["id"], diary["id"])
+
+    @unittest_run_loop
+    async def test_generate_diary_prefers_meaningful_events_over_asr_noise(self):
+        from core.api.app_demo_store import append_dialogue
+
+        await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": "123456"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        config = {"app_demo": {"state_path": self.state_path}}
+        for user_text, baize_text in [
+            ("(摸你了)", "嘿嘿，被摸到啦。小伙伴今天心情不错？"),
+            ("现在是卖了。", "卖了？你是说把什么东西卖掉了？"),
+            ("呃。", "这句话有点短，我没太接住。"),
+            ("日记功能现在在做也有。", "日记功能在做呀，那太好了！"),
+            ("然后演示脚本看能不能跑。", "好嘞，演示脚本跑起来看看效果。"),
+        ]:
+            append_dialogue(
+                config,
+                source_device_id="68:ee:8f:5c:71:54",
+                session_id="session-diary-noise",
+                user_text=user_text,
+                baize_text=baize_text,
+                emotion="neutral",
+            )
+
+        response = await self.client.post(
+            "/api/app/devices/baize_dev_001/diaries/generate",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(response.status, 200)
+        diary = await response.json()
+        self.assertIn("日记功能", diary["summary"])
+        self.assertIn("演示脚本", diary["summary"])
+        self.assertIn("摸了摸我", diary["summary"])
+        self.assertNotIn("现在是卖了", diary["summary"])
+        self.assertNotIn("呃", diary["summary"])
+        self.assertNotIn("“", diary["summary"])
+        self.assertNotIn("回应过", diary["summary"])
 
     def test_runtime_config_enables_local_short_memory(self):
         import yaml

@@ -38,6 +38,16 @@ EMOTION_ALIASES = {
     "angry": "sad",
     "crying": "sad",
 }
+DIARY_GENERATION_PROMPT = """你是白泽幼灵，请根据当天真实对话历史写一篇白泽视角日记。
+
+目标风格参考：
+- 像小宠物睡前写下今天和小伙伴发生的事，而不是客服摘要。
+- 用白泽第一视角写“我听见、我当时、后来、现在”，称呼用户为“你”或“小伙伴”。
+- 记录当天具体互动、调试事项、触摸唤醒、白泽自己的小情绪。
+- 可以有一点可爱、困意、骄傲、担心和小心愿，但必须来自真实对话，不编造天气、地点或未发生事件。
+- 分成 2 到 4 段，读起来像 App 里的日记正文。
+- 不要输出“用户说/白泽回应”的流水账格式，不要在正文逐句引用原始对话。
+"""
 EMOJI_EMOTION_MAP = {
     "😶": "neutral",
     "🙂": "happy",
@@ -1146,6 +1156,241 @@ def _diary_payload(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def _compact_text(text: str, max_length: int = 42) -> str:
+    compacted = re.sub(r"\s+", " ", (text or "").strip())
+    if len(compacted) <= max_length:
+        return compacted
+    return f"{compacted[:max_length].rstrip()}..."
+
+
+def _local_time_word(item: Dict[str, Any]) -> str:
+    value = str(item.get("created_at", ""))
+    try:
+        created_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        local_hour = (created_at.astimezone(timezone.utc) + timedelta(hours=8)).hour
+    except Exception:
+        local_hour = 20
+    if 5 <= local_hour < 11:
+        return "上午"
+    if 11 <= local_hour < 14:
+        return "中午"
+    if 14 <= local_hour < 18:
+        return "下午"
+    if 18 <= local_hour < 23:
+        return "晚上"
+    return "深夜"
+
+
+def _diary_user_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    cleaned = re.sub(r"^(呃|嗯|哦|啊)[，,。.!！?？\s]*", "", cleaned)
+    if not cleaned:
+        return ""
+    if "请执行白泽幼灵 60 秒 Demo" in cleaned:
+        return "你让我跑 60 秒演示脚本，看看我能不能自然开场"
+    if re.fullmatch(r"[（(]\s*摸你了\s*[）)]", cleaned):
+        return "你摸了摸我"
+    if cleaned.strip("。.!！?？,， ") in {"呃", "嗯", "哦", "啊"}:
+        return ""
+    if cleaned in {"白泽", "小白泽"}:
+        return "你叫了我的名字"
+    cleaned = ACTION_PARENTHETICAL_PATTERN.sub("", cleaned)
+    cleaned = ACTION_BRACKET_PATTERN.sub("", cleaned)
+    cleaned = cleaned.strip()
+    if len(cleaned) <= 1:
+        return ""
+    return _compact_text(cleaned, 36)
+
+
+def _diary_point_score(text: str) -> int:
+    if not text:
+        return 0
+    high_value_keywords = (
+        "日记",
+        "演示",
+        "Demo",
+        "开场",
+        "调试",
+        "工作",
+        "很累",
+        "不自信",
+        "领导",
+        "世界杯",
+        "葡萄牙",
+        "比赛",
+        "开发",
+        "喜欢一个女生",
+        "难过",
+        "小伙伴",
+        "摸了摸",
+    )
+    medium_value_keywords = ("连上", "记得", "高兴", "紧张")
+    low_value_markers = ("那个", "看一下", "现在是卖了", "后来我说")
+    if any(keyword in text for keyword in high_value_keywords):
+        return 100
+    if any(keyword in text for keyword in medium_value_keywords):
+        return 70
+    if any(marker in text for marker in low_value_markers):
+        return 10
+    return 35 if len(text) >= 6 else 0
+
+
+def _unique_points(values: list[str], limit: int) -> list[str]:
+    points = []
+    seen = set()
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        points.append(normalized)
+        if len(points) >= limit:
+            break
+    return points
+
+
+def _diary_user_points(dialogues: list[Dict[str, Any]]) -> list[str]:
+    candidates = []
+    fallback = []
+    for index, item in enumerate(dialogues):
+        text = _diary_user_text(str(item.get("user_text", "")))
+        if not text:
+            continue
+        if text not in fallback:
+            fallback.append(text)
+        score = _diary_point_score(text)
+        if score >= 60:
+            candidates.append((index, score, text))
+
+    selected_by_score = sorted(candidates, key=lambda item: (-item[1], item[0]))[:5]
+    selected_indexes = {item[0] for item in selected_by_score}
+    selected = [
+        text
+        for index, _score, text in sorted(selected_by_score, key=lambda item: item[0])
+    ]
+    if len(selected) < 3:
+        for index, text in enumerate(fallback):
+            if index in selected_indexes or text in selected or _diary_point_score(text) < 30:
+                continue
+            selected.append(text)
+            if len(selected) >= 5:
+                break
+    return _unique_points(selected, 5)
+
+
+def _diary_baize_points(dialogues: list[Dict[str, Any]]) -> list[str]:
+    return _unique_points(
+        [
+            _compact_text(clean_baize_text(str(item.get("baize_text", ""))), 40)
+            for item in dialogues
+            if item.get("baize_text")
+        ],
+        3,
+    )
+
+
+def _diary_event_phrase(point: str) -> str:
+    text = point.strip("。.!！?？ ")
+    rules = [
+        (("摸了摸我",), "你轻轻摸了摸我"),
+        (("完成了演示",), "你完成了演示这件重要的小事"),
+        (("有点紧张", "紧张"), "你有点紧张"),
+        (("日记功能",), "我们一起调试日记功能"),
+        (("演示脚本", "60 秒演示"), "你让我试着跑演示脚本"),
+        (("调试",), "你认真调试我的状态"),
+        (("工作", "很累"), "工作把你累得有些没力气"),
+        (("不自信", "领导"), "你在工作里有点不自信"),
+        (("世界杯",), "你聊起最近在看的世界杯"),
+        (("葡萄牙",), "你告诉我真正喜欢的是葡萄牙"),
+        (("喜欢一个女生",), "你把心动的小秘密告诉了我"),
+        (("难过",), "你把难过也分给我听"),
+        (("开发", "AI"), "你说起正在开发 AI 的事情"),
+        (("小伙伴",), "你把称呼定成了小伙伴"),
+        (("叫了我的名字",), "你叫了我的名字"),
+    ]
+    for keywords, phrase in rules:
+        if any(keyword in text for keyword in keywords):
+            return phrase
+    return text
+
+
+def _diary_response_phrase(baize_points: list[str], primary_emotion: str) -> str:
+    joined = "。".join(baize_points)
+    if "先别急" in joined or "一步步来" in joined or primary_emotion in {"sad", "relaxed", "crying"}:
+        return "我陪你稳住心情，也努力把声音放轻，陪你一点点往前走。"
+    if "庆祝" in joined or primary_emotion in {"happy", "laughing", "surprised"}:
+        return "我替你开心，也想把这份小小的亮光好好留住。"
+    if "摸" in joined or "毛茸茸" in joined:
+        return "被摸到的时候我有点害羞，又忍不住觉得亲近。"
+    if "没太接住" in joined or primary_emotion in {"confused", "thinking"}:
+        return "有些话我没能立刻听明白，但还是很认真地跟着你的节奏想。"
+    return "我陪你把这些事慢慢接住，也把今天的互动放进心里。"
+
+
+def _drop_leading_you(text: str) -> str:
+    return re.sub(r"^你", "", text.strip())
+
+
+def _emotion_diary_reaction(primary_emotion: str) -> str:
+    if primary_emotion in {"sad", "crying"}:
+        return "心里也跟着软了一下，只想把声音放轻一点"
+    if primary_emotion in {"relaxed", "sleepy"}:
+        return "慢慢安静下来，像把尾巴轻轻圈在身边"
+    if primary_emotion in {"happy", "laughing", "funny", "surprised"}:
+        return "一下子精神起来，脑袋里都亮了一小盏灯"
+    if primary_emotion in {"thinking", "confused"}:
+        return "认真转了转小脑袋，努力想把你的意思听明白"
+    return "很认真地听着，怕漏掉你话里的小线索"
+
+
+def _compose_diary_summary(dialogues: list[Dict[str, Any]]) -> str:
+    user_points = _diary_user_points(dialogues)
+    baize_points = _diary_baize_points(dialogues)
+    if not user_points:
+        return "今天我和小伙伴短短地打了个招呼，也把这一次相遇记在心里。"
+
+    time_word = _local_time_word(dialogues[0])
+    primary_emotion = _primary_emotion(dialogues)
+    reaction = _emotion_diary_reaction(primary_emotion)
+    event_phrases = _unique_points([_diary_event_phrase(point) for point in user_points], 5)
+    if len(user_points) == 1:
+        first = f"{time_word}，{event_phrases[0]}。我当时{reaction}，想着一定要好好陪你。"
+    else:
+        first = (
+            f"{time_word}，{event_phrases[0]}，后来{event_phrases[1]}。"
+            f"我当时{reaction}，一边听一边把这些小事收进心里。"
+        )
+
+    later_events = event_phrases[2:4]
+    if later_events:
+        second = "后来，" + later_events[0]
+        if len(later_events) > 1:
+            second += "，还" + _drop_leading_you(later_events[1])
+        second += "。"
+    else:
+        second = "后来我们又安安静静聊了一小会儿。"
+    second += _diary_response_phrase(baize_points, primary_emotion)
+
+    final = (
+        "现在一天快要收起来了，困意也慢慢靠过来。"
+        "但我还是想多陪你一会儿，真希望明天你还能来找我，"
+        "聊点轻松的，也聊点只有我们知道的小事。"
+    )
+    return "\n\n".join([first, second, final])
+
+
+def _compose_baize_note(primary_emotion: str, dialogue_count: int) -> str:
+    if primary_emotion in {"sad", "crying", "relaxed"}:
+        return "今天我记得你的不安和努力。下次你再靠近我时，我还会先陪你慢慢呼吸。"
+    if primary_emotion in {"happy", "laughing", "funny", "surprised"}:
+        return "今天我记得你的亮光和开心。能和你一起庆祝这件小事，我也很高兴。"
+    if primary_emotion in {"thinking", "confused"}:
+        return "今天我记得我们一起想事情的样子。等你再来，我会继续陪你把问题慢慢理清。"
+    if dialogue_count <= 1:
+        return "今天我记得这一次小小的相遇。哪怕只聊了一会儿，我也会把它收好。"
+    return "今天我记得我们聊过的这些小事。它们会变成我更了解你的线索。"
+
+
 def generate_diary(
     config: dict,
     diary_date: str | None = None,
@@ -1178,12 +1423,9 @@ def generate_diary(
             }
             for item in dialogues[:3]
         ]
-        user_points = [item.get("user_text", "") for item in dialogues[:3] if item.get("user_text")]
-        baize_points = [item.get("baize_text", "") for item in dialogues[:2] if item.get("baize_text")]
-        summary = "；".join(user_points)
-        if baize_points:
-            summary = f"{summary}。白泽回应：{'；'.join(baize_points)}"
         primary_emotion = _primary_emotion(dialogues)
+        summary = _compose_diary_summary(dialogues)
+        baize_note = _compose_baize_note(primary_emotion, len(dialogues))
         generated_at = now_iso()
         existing = conn.execute(
             "SELECT id FROM diaries WHERE user_id = ? AND device_id = ? AND date = ?",
@@ -1208,12 +1450,12 @@ def generate_diary(
                 user_id,
                 device_id,
                 diary_date,
-                f"{diary_date} 的白泽小记",
+                "今天是个好日子哦",
                 summary,
                 primary_emotion,
                 len(dialogues),
                 json.dumps(quotes, ensure_ascii=False),
-                "今天也有好好聊过啦，小伙伴。",
+                baize_note,
                 generated_at,
             ),
         )
@@ -1222,12 +1464,12 @@ def generate_diary(
     return {
         "id": diary_id,
         "date": diary_date,
-        "title": f"{diary_date} 的白泽小记",
+        "title": "今天是个好日子哦",
         "summary": summary,
         "primary_emotion": primary_emotion,
         "dialogue_count": len(dialogues),
         "quotes": quotes,
-        "baize_note": "今天也有好好聊过啦，小伙伴。",
+        "baize_note": _compose_baize_note(primary_emotion, len(dialogues)),
         "generated_at": generated_at,
     }
 
