@@ -1,0 +1,18 @@
+[Unit]
+Description=Baize Xiaozhi Python Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qilei
+WorkingDirectory=/opt/baize-server/xiaozhi-server
+ExecStart=/opt/miniconda/envs/baize/bin/python app.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/opt/baize-server/xiaozhi-server/tmp/baize-server.log
+StandardError=append:/opt/baize-server/xiaozhi-server/tmp/baize-server.log
+
+[Install]
+WantedBy=multi-user.target

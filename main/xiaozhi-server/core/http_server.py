@@ -2,6 +2,7 @@ import asyncio
 from aiohttp import web
 from config.logger import setup_logging
 from core.api.app_demo_handler import AppDemoHandler
+from core.api.health_handler import HealthHandler
 from core.api.ota_handler import OTAHandler
 from core.api.vision_handler import VisionHandler
 
@@ -13,6 +14,7 @@ class SimpleHttpServer:
         self.config = config
         self.logger = setup_logging()
         self.app_demo_handler = AppDemoHandler(config, device_registry=device_registry)
+        self.health_handler = HealthHandler(config)
         self.ota_handler = OTAHandler(config)
         self.vision_handler = VisionHandler(config)
 
@@ -44,6 +46,7 @@ class SimpleHttpServer:
             if port:
                 app = web.Application()
                 app.add_routes(self.app_demo_handler.routes())
+                app.add_routes(self.health_handler.routes())
 
                 if not read_config_from_api:
                     # 如果没有开启智控台，只是单模块运行，就需要再添加简单OTA接口，用于下发websocket接口

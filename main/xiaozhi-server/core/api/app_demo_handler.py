@@ -189,39 +189,39 @@ class AppDemoHandler(BaseHandler):
         return self._json_response({"updated": True})
 
     async def handle_admin_metrics(self, request):
-        user = self._current_user(request)
-        if not user:
-            return self._error_response("未登录或 token 无效", status=401)
+        response = self._require_admin_response(request)
+        if response:
+            return response
         return self._json_response(admin_metrics(self.config))
 
     async def handle_admin_conversations(self, request):
-        user = self._current_user(request)
-        if not user:
-            return self._error_response("未登录或 token 无效", status=401)
+        response = self._require_admin_response(request)
+        if response:
+            return response
         return self._json_response({"items": list_admin_conversations(self.config, self._limit(request))})
 
     async def handle_admin_energy_events(self, request):
-        user = self._current_user(request)
-        if not user:
-            return self._error_response("未登录或 token 无效", status=401)
+        response = self._require_admin_response(request)
+        if response:
+            return response
         return self._json_response({"items": list_energy_events(self.config, self._limit(request))})
 
     async def handle_admin_intimacy_events(self, request):
-        user = self._current_user(request)
-        if not user:
-            return self._error_response("未登录或 token 无效", status=401)
+        response = self._require_admin_response(request)
+        if response:
+            return response
         return self._json_response({"items": list_intimacy_events(self.config, self._limit(request))})
 
     async def handle_admin_devices(self, request):
-        user = self._current_user(request)
-        if not user:
-            return self._error_response("未登录或 token 无效", status=401)
+        response = self._require_admin_response(request)
+        if response:
+            return response
         return self._json_response({"items": list_admin_devices(self.config)})
 
     async def handle_admin_create_device(self, request):
-        user = self._current_user(request)
-        if not user:
-            return self._error_response("未登录或 token 无效", status=401)
+        response = self._require_admin_response(request)
+        if response:
+            return response
         payload = await self._read_json(request)
         try:
             device = create_device(
@@ -238,9 +238,9 @@ class AppDemoHandler(BaseHandler):
         return self._json_response(device)
 
     async def handle_admin_rotate_device_code(self, request):
-        user = self._current_user(request)
-        if not user:
-            return self._error_response("未登录或 token 无效", status=401)
+        response = self._require_admin_response(request)
+        if response:
+            return response
         payload = await self._read_json(request)
         try:
             device = rotate_device_code(
@@ -529,6 +529,14 @@ class AppDemoHandler(BaseHandler):
         if not auth_header.startswith("Bearer "):
             return None
         return user_for_token(self.config, auth_header.removeprefix("Bearer ").strip())
+
+    def _require_admin_response(self, request) -> web.Response | None:
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        if user.get("role") != "admin":
+            return self._error_response("需要管理员权限", status=403)
+        return None
 
     def _get_bound_device_or_response(self, request) -> tuple[Dict[str, Any] | None, Any]:
         user = self._current_user(request)

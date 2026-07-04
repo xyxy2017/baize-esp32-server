@@ -33,6 +33,7 @@ sys.modules.setdefault("config.logger", logger_module)
 sys.modules.setdefault("opuslib_next", types.ModuleType("opuslib_next"))
 
 from core.api.app_demo_handler import AppDemoHandler, DEMO_TOKEN
+from core.api.health_handler import HealthHandler
 from core.api.ota_handler import OTAHandler
 
 
@@ -79,6 +80,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
                 "websocket": "ws://127.0.0.1:8000/xiaozhi/v1/",
             },
             "app_demo": {"state_path": state_path},
+            "app_mvp": {"admin_phones": ["13800138001"]},
             "firmware_cache_ttl": 30,
             "prompt": "你是白泽幼灵，来自上古神话世界，是神兽白泽的幼年形态。你默认称呼用户为小伙伴，也可以偶尔使用朋友或伙伴，不使用主人称呼。",
             "prompt_template": str(prompt_template_path),
@@ -124,10 +126,12 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             mcp_status_refresher=fake_status_refresher,
             demo_runner=fake_demo_runner,
         )
+        health_handler = HealthHandler(self.config)
         ota_handler = OTAHandler(self.config)
         ota_handler.bin_dir = self.bin_dir
         app = web.Application()
         app.add_routes(handler.routes())
+        app.add_routes(health_handler.routes())
         app.add_routes([web.post("/xiaozhi/ota/", ota_handler.handle_post)])
         return app
 
@@ -234,6 +238,24 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(response.status, 401)
 
     @unittest_run_loop
+    async def test_healthz_reports_sqlite_and_ports_without_auth(self):
+        response = await self.client.get("/healthz")
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["service"], "baize-xiaozhi-server")
+        self.assertEqual(payload["http_port"], 8003)
+        self.assertEqual(payload["websocket_port"], 8000)
+        self.assertTrue(payload["sqlite"]["ok"])
+        self.assertIn("uptime_seconds", payload)
+
+    def test_healthz_reports_sqlite_error(self):
+        handler = HealthHandler({"app_mvp": {"db_path": tempfile.mkdtemp()}})
+        payload = handler._sqlite_health()
+        self.assertFalse(payload["ok"])
+        self.assertIn("error", payload)
+
+    @unittest_run_loop
     async def test_invite_auth_and_user_scoped_devices(self):
         register_response = await self.client.post(
             "/api/app/register",
@@ -287,6 +309,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         register_payload = await register_response.json()
         self.assertEqual(register_payload["user"]["phone"], "13800138000")
         self.assertEqual(register_payload["user"]["nickname"], "138****8000")
+        self.assertEqual(register_payload["user"]["role"], "user")
         token = register_payload["token"]
 
         duplicate_response = await self.client.post(
@@ -324,7 +347,9 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         )
         self.assertEqual(login_response.status, 200)
         login_payload = await login_response.json()
-        self.assertIn("energy", await (await self.client.get("/api/app/me", headers={"Authorization": f"Bearer {login_payload['token']}"})).json())
+        me_payload = await (await self.client.get("/api/app/me", headers={"Authorization": f"Bearer {login_payload['token']}"})).json()
+        self.assertIn("energy", me_payload)
+        self.assertEqual(me_payload["role"], "user")
 
         update_response = await self.client.post(
             "/api/app/me/password",
@@ -354,7 +379,9 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             data=json.dumps({"phone": "13800138001", "password": "secret1", "nickname": "Alice"}),
             headers={"Content-Type": "application/json"},
         )
-        alice_token = (await alice_response.json())["token"]
+        alice_payload = await alice_response.json()
+        self.assertEqual(alice_payload["user"]["role"], "admin")
+        alice_token = alice_payload["token"]
         alice_headers = {"Authorization": f"Bearer {alice_token}", "Content-Type": "application/json"}
 
         create_response = await self.client.post(
@@ -378,7 +405,13 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             data=json.dumps({"phone": "13800138002", "password": "secret1", "nickname": "Bob"}),
             headers={"Content-Type": "application/json"},
         )
-        bob_token = (await bob_response.json())["token"]
+        bob_payload = await bob_response.json()
+        self.assertEqual(bob_payload["user"]["role"], "user")
+        bob_token = bob_payload["token"]
+        bob_metrics_response = await self.client.get(
+            "/api/app/admin/metrics", headers={"Authorization": f"Bearer {bob_token}"}
+        )
+        self.assertEqual(bob_metrics_response.status, 403)
         bob_bind_response = await self.client.post(
             "/api/app/devices/bind",
             data=json.dumps({"device_code": "654321"}),
@@ -424,15 +457,26 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         )
         self.assertEqual(chat_response.status, 200)
 
-        conversations_response = await self.client.get("/api/app/admin/conversations", headers=self.auth_headers())
+        admin_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138001", "password": "secret1", "nickname": "Admin"}),
+            headers={"Content-Type": "application/json"},
+        )
+        admin_token = (await admin_response.json())["token"]
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+        forbidden_response = await self.client.get("/api/app/admin/conversations", headers=self.auth_headers())
+        self.assertEqual(forbidden_response.status, 403)
+
+        conversations_response = await self.client.get("/api/app/admin/conversations", headers=admin_headers)
         self.assertEqual(conversations_response.status, 200)
         self.assertGreaterEqual(len((await conversations_response.json())["items"]), 1)
 
-        energy_response = await self.client.get("/api/app/admin/energy-events", headers=self.auth_headers())
+        energy_response = await self.client.get("/api/app/admin/energy-events", headers=admin_headers)
         self.assertEqual(energy_response.status, 200)
         self.assertGreaterEqual(len((await energy_response.json())["items"]), 1)
 
-        intimacy_response = await self.client.get("/api/app/admin/intimacy-events", headers=self.auth_headers())
+        intimacy_response = await self.client.get("/api/app/admin/intimacy-events", headers=admin_headers)
         self.assertEqual(intimacy_response.status, 200)
         self.assertGreaterEqual(len((await intimacy_response.json())["items"]), 1)
 

@@ -18,6 +18,9 @@ INITIAL_ENERGY = 30
 DAILY_ENERGY_LIMIT = 30
 PASSWORD_MIN_LENGTH = 6
 PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
+USER_ROLE = "user"
+ADMIN_ROLE = "admin"
+VALID_ROLES = {USER_ROLE, ADMIN_ROLE}
 
 MVP_EMOTIONS = {"neutral", "happy", "thinking", "surprised", "sad", "sleepy", "confused"}
 EMOTION_ALIASES = {
@@ -299,6 +302,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
     if "password_updated_at" not in user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN password_updated_at TEXT")
+    if "role" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL AND phone != ''")
     conn.execute(
         """
@@ -327,6 +332,28 @@ def validate_phone(phone: str) -> str:
     if not PHONE_PATTERN.match(phone):
         raise ValueError("phone 格式不正确")
     return phone
+
+
+def _admin_phones_from_config(config: dict) -> set[str]:
+    raw_values = config.get("app_mvp", {}).get("admin_phones") or []
+    if isinstance(raw_values, str):
+        raw_values = [raw_values]
+    return {normalize_phone(str(item)) for item in raw_values if normalize_phone(str(item))}
+
+
+def role_for_phone(config: dict, phone: str | None) -> str:
+    return ADMIN_ROLE if normalize_phone(phone) in _admin_phones_from_config(config) else USER_ROLE
+
+
+def sync_configured_admin_roles(config: dict, conn: sqlite3.Connection) -> None:
+    admin_phones = _admin_phones_from_config(config)
+    if not admin_phones:
+        return
+    placeholders = ",".join("?" for _ in admin_phones)
+    conn.execute(
+        f"UPDATE users SET role = ? WHERE phone IN ({placeholders})",
+        (ADMIN_ROLE, *sorted(admin_phones)),
+    )
 
 
 def _validate_password(password: str) -> str:
@@ -408,12 +435,14 @@ def _ensure_demo_seed(conn: sqlite3.Connection) -> None:
 
 def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
     phone = row["phone"] if "phone" in row.keys() else None
+    role = row["role"] if "role" in row.keys() and row["role"] in VALID_ROLES else USER_ROLE
     return {
         "id": row["id"],
         "nickname": row["nickname"],
         "display_name": row["nickname"],
         "phone": phone,
         "masked_phone": mask_phone(phone) if phone else None,
+        "role": role,
         "login_type": row["login_type"],
         "invite_code": row["invite_code"],
         "created_at": row["created_at"],
@@ -634,7 +663,9 @@ def register_phone_user(config: dict, phone: str, password: str, nickname: str =
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     now = now_iso()
+    role = role_for_phone(config, phone)
     with _connect(db_path) as conn:
+        sync_configured_admin_roles(config, conn)
         exists = conn.execute("SELECT 1 FROM users WHERE phone = ?", (phone,)).fetchone()
         if exists:
             raise ValueError("phone 已注册")
@@ -643,10 +674,10 @@ def register_phone_user(config: dict, phone: str, password: str, nickname: str =
             """
             INSERT INTO users(
                 id, nickname, login_type, invite_code, phone, password_hash,
-                password_updated_at, created_at, last_login_at
-            ) VALUES (?, ?, 'phone_password', '', ?, ?, ?, ?, ?)
+                password_updated_at, role, created_at, last_login_at
+            ) VALUES (?, ?, 'phone_password', '', ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, nickname, phone, _hash_password(password), now, now, now),
+            (user_id, nickname, phone, _hash_password(password), now, role, now, now),
         )
         _ensure_energy(conn, user_id)
         token, expires_at = _issue_token(conn, user_id, now)
@@ -662,10 +693,14 @@ def login_phone_user(config: dict, phone: str, password: str) -> Dict[str, Any]:
     ensure_db(db_path)
     now = now_iso()
     with _connect(db_path) as conn:
+        sync_configured_admin_roles(config, conn)
         row = conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
         if row is None or not _verify_password(password, row["password_hash"]):
             raise ValueError("手机号或密码错误")
-        conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, row["id"]))
+        conn.execute(
+            "UPDATE users SET last_login_at = ?, role = ? WHERE id = ?",
+            (now, role_for_phone(config, phone), row["id"]),
+        )
         _ensure_energy(conn, row["id"])
         token, expires_at = _issue_token(conn, row["id"], now)
         conn.commit()
@@ -698,6 +733,7 @@ def user_for_token(config: dict, token: str) -> Dict[str, Any] | None:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
+        sync_configured_admin_roles(config, conn)
         row = conn.execute(
             """
             SELECT u.* FROM auth_tokens t
@@ -1334,6 +1370,7 @@ def user_summary(config: dict, user_id: str) -> Dict[str, Any]:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
+        sync_configured_admin_roles(config, conn)
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if not user_row:
             return {}
