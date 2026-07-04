@@ -233,6 +233,49 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(response.status, 401)
 
     @unittest_run_loop
+    async def test_invite_auth_and_user_scoped_devices(self):
+        register_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"invite_code": "BAIZE-MVP", "nickname": "Alice"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(register_response.status, 200)
+        register_payload = await register_response.json()
+        alice_token = register_payload["token"]
+        alice_headers = {"Authorization": f"Bearer {alice_token}"}
+
+        me_response = await self.client.get("/api/app/me", headers=alice_headers)
+        self.assertEqual(me_response.status, 200)
+        me_payload = await me_response.json()
+        self.assertEqual(me_payload["nickname"], "Alice")
+        self.assertEqual(me_payload["energy"]["current"], 30)
+        self.assertEqual(me_payload["intimacy"]["level"], "初识")
+
+        empty_devices = await self.client.get("/api/app/devices", headers=alice_headers)
+        self.assertEqual(await empty_devices.json(), {"items": []})
+
+        bind_response = await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": "123456"}),
+            headers={**alice_headers, "Content-Type": "application/json"},
+        )
+        self.assertEqual(bind_response.status, 200)
+        self.assertEqual((await bind_response.json())["id"], "baize_dev_001")
+
+        bob_response = await self.client.post(
+            "/api/app/login",
+            data=json.dumps({"invite_code": "BAIZE-MVP", "nickname": "Bob"}),
+            headers={"Content-Type": "application/json"},
+        )
+        bob_token = (await bob_response.json())["token"]
+        bob_headers = {"Authorization": f"Bearer {bob_token}"}
+
+        bob_detail = await self.client.get(
+            "/api/app/devices/baize_dev_001", headers=bob_headers
+        )
+        self.assertEqual(bob_detail.status, 404)
+
+    @unittest_run_loop
     async def test_device_detail_marks_stale_online_state_offline_without_active_connection(self):
         from core.api.app_demo_store import update_device_report
 
@@ -409,7 +452,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         )
         payload = await response.json()
         self.assertEqual(payload["items"][0]["baize_text"], "很开心呀，旅伴。")
-        self.assertEqual(payload["items"][0]["emotion"], "laughing")
+        self.assertEqual(payload["items"][0]["emotion"], "happy")
 
     @unittest_run_loop
     async def test_dialogues_strip_action_parentheticals_from_baize_text(self):
@@ -477,7 +520,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             session_id="session-diary",
             user_text="白泽，我今天完成了演示。",
             baize_text="😆 哇，可以啊！这一下值得小小庆祝。",
-            emotion="laughing",
+            emotion="happy",
         )
         append_dialogue(
             {"app_demo": {"state_path": self.state_path}},
@@ -485,7 +528,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             session_id="session-diary",
             user_text="不过我还是有点紧张。",
             baize_text="😌 我在呢，先别急。我们一步步来。",
-            emotion="relaxed",
+            emotion="happy",
         )
 
         generate_response = await self.client.post(
@@ -496,7 +539,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(generate_response.status, 200)
         diary = await generate_response.json()
         self.assertEqual(diary["dialogue_count"], 2)
-        self.assertEqual(diary["primary_emotion"], "relaxed")
+        self.assertEqual(diary["primary_emotion"], "happy")
         self.assertIn("完成了演示", diary["summary"])
         self.assertIn("有点紧张", diary["summary"])
         self.assertEqual(len(diary["quotes"]), 2)
@@ -523,9 +566,9 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         cases = {
             "我在呢，旅伴。": "neutral",
             "🤔 我想想，这事有点像月光下的谜题。": "thinking",
-            "😌 别急，我陪你慢慢来。": "relaxed",
+            "😌 别急，我陪你慢慢来。": "happy",
             "🙄 我刚刚没太听清，可以再说一次吗？": "confused",
-            "😆 哇，这个主意真亮！": "laughing",
+            "😆 哇，这个主意真亮！": "happy",
         }
         for text, expected in cases.items():
             with self.subTest(text=text):
@@ -551,13 +594,13 @@ class AppDemoHandlerTest(AioHTTPTestCase):
 
         await get_emotion(conn, "😌 别急，我陪你慢慢来。")
 
-        self.assertEqual(conn.latest_emotion, "relaxed")
+        self.assertEqual(conn.latest_emotion, "happy")
         self.assertEqual(
             conn.websocket.messages[0],
             {
                 "type": "llm",
                 "text": "😌",
-                "emotion": "relaxed",
+                "emotion": "happy",
                 "session_id": "session-emotion",
             },
         )
