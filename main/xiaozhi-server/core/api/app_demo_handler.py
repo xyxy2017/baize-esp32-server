@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any, Dict
 
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
 
 from core.api.app_demo_store import (
     DEMO_TOKEN,
@@ -487,13 +488,15 @@ class AppDemoHandler(BaseHandler):
         queue = asyncio.Queue()
         self._event_subscribers.setdefault(device_id, set()).add(queue)
         try:
-            await ws.send_json(self._device_event(device_or_response, "device.status.snapshot"))
+            if not await self._send_device_event_json(ws, self._device_event(device_or_response, "device.status.snapshot")):
+                return ws
             while not ws.closed:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30)
                 except asyncio.TimeoutError:
                     continue
-                await ws.send_json(event)
+                if not await self._send_device_event_json(ws, event):
+                    break
         finally:
             subscribers = self._event_subscribers.get(device_id)
             if subscribers is not None:
@@ -640,6 +643,15 @@ class AppDemoHandler(BaseHandler):
             "device_id": device["id"],
             "device": self._device_payload(device),
         }
+
+    async def _send_device_event_json(self, ws: web.WebSocketResponse, event: Dict[str, Any]) -> bool:
+        if ws.closed:
+            return False
+        try:
+            await ws.send_json(event)
+            return True
+        except (ClientConnectionResetError, ConnectionResetError, RuntimeError):
+            return False
 
     async def _broadcast_device_event(self, device_id: str, event: Dict[str, Any]) -> None:
         queues = list(self._event_subscribers.get(device_id, set()))

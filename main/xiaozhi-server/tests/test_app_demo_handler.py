@@ -7,6 +7,7 @@ from pathlib import Path
 
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
 
 logger_module = types.ModuleType("config.logger")
 
@@ -136,6 +137,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             mcp_status_refresher=fake_status_refresher,
             demo_runner=fake_demo_runner,
         )
+        self.handler = handler
         health_handler = HealthHandler(self.config)
         ota_handler = OTAHandler(self.config)
         ota_handler.bin_dir = self.bin_dir
@@ -656,6 +658,21 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(payload["matched_value"], "client-mcp-001")
         self.assertEqual(payload["device"]["source_device_id"], "68:ee:8f:5c:71:54")
         self.assertEqual(payload["active_identifiers"], ["client-mcp-001"])
+
+    @unittest_run_loop
+    async def test_device_events_treat_closing_transport_as_normal_disconnect(self):
+        class _ClosingWebSocket:
+            closed = False
+
+            async def send_json(self, _event):
+                raise ClientConnectionResetError("Cannot write to closing transport")
+
+        delivered = await self.handler._send_device_event_json(
+            _ClosingWebSocket(),
+            {"type": "device.status.updated", "device_id": "baize_dev_001"},
+        )
+
+        self.assertFalse(delivered)
 
     @unittest_run_loop
     async def test_dialogues_include_real_device_conversation_records(self):
