@@ -315,15 +315,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "role" not in user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL AND phone != ''")
-    conn.execute(
-        """
-        DELETE FROM user_device_bindings
-        WHERE rowid NOT IN (
-            SELECT MIN(rowid) FROM user_device_bindings GROUP BY device_id
-        )
-        """
-    )
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_device_unique ON user_device_bindings(device_id)")
+    conn.execute("DROP INDEX IF EXISTS idx_bindings_device_unique")
 
 
 def normalize_phone(phone: str | None) -> str:
@@ -795,6 +787,28 @@ def _is_bound_conn(conn: sqlite3.Connection, user_id: str, device_id: str) -> bo
     ).fetchone() is not None
 
 
+def demo_auto_bind_new_devices_to_all_users(config: dict) -> bool:
+    app_mvp = config.get("app_mvp", {}) or {}
+    app_demo = config.get("app_demo", {}) or {}
+    if "demo_auto_bind_new_devices_to_all_users" in app_mvp:
+        return bool(app_mvp["demo_auto_bind_new_devices_to_all_users"])
+    if "demo_auto_bind_new_devices_to_all_users" in app_demo:
+        return bool(app_demo["demo_auto_bind_new_devices_to_all_users"])
+    return True
+
+
+def _bind_device_to_all_users(conn: sqlite3.Connection, device_id: str) -> None:
+    bound_at = now_iso()
+    rows = conn.execute("SELECT id FROM users ORDER BY created_at, id").fetchall()
+    for row in rows:
+        user_id = row["id"]
+        conn.execute(
+            "INSERT OR IGNORE INTO user_device_bindings(user_id, device_id, bound_at) VALUES (?, ?, ?)",
+            (user_id, device_id, bound_at),
+        )
+        _ensure_intimacy(conn, user_id, device_id)
+
+
 def bind_device(config: dict, user_id: str, device_code: str) -> Dict[str, Any] | None:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
@@ -823,47 +837,20 @@ def create_device(
     model: str | None = None,
     firmware_version: str | None = None,
 ) -> Dict[str, Any]:
-    device_code = (device_code or str(uuid.uuid4().int)[0:6]).strip()
-    if not device_code:
-        raise ValueError("device_code 不能为空")
-    display_name = (display_name or "我的白泽").strip()
-    device_id = f"baize_{uuid.uuid4().hex[:12]}"
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
-        if conn.execute("SELECT 1 FROM devices WHERE device_code = ?", (device_code,)).fetchone():
-            raise ValueError("device_code 已存在")
-        version = (firmware_version or "0.1.0-demo").strip()
-        conn.execute(
-            """
-            INSERT INTO devices(
-                id, device_code, display_name, source_device_id, client_id, model,
-                online_status, firmware_version, current_version, latest_version,
-                update_available, release_note
-            ) VALUES (?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, 0, ?)
-            """,
-            (
-                device_id,
-                device_code,
-                display_name,
-                (source_device_id or "").strip() or None,
-                (client_id or "").strip() or None,
-                (model or "").strip() or None,
-                version,
-                version,
-                version,
-                f"设备当前版本 {version}",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO device_settings(device_id, baize_nickname, user_call_name, personality_mode, tts_voice)
-            VALUES (?, '白泽', '小伙伴', 'curious', 'Sambert 知颖')
-            """,
-            (device_id,),
+        row = _insert_device(
+            conn,
+            device_code=device_code,
+            display_name=display_name,
+            source_device_id=source_device_id,
+            client_id=client_id,
+            model=model,
+            firmware_version=firmware_version,
         )
         conn.commit()
-        return device_payload(conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone())
+        return device_payload(row)
 
 
 def list_admin_devices(config: dict) -> list[Dict[str, Any]]:
@@ -1020,6 +1007,99 @@ def _device_id_for_source(conn: sqlite3.Connection, source_device_id: str) -> st
         if row:
             return row["id"]
     return DEMO_DEVICE_ID
+
+
+def _find_device_row_for_source(
+    conn: sqlite3.Connection,
+    source_device_id: str = "",
+    client_id: str = "",
+) -> sqlite3.Row | None:
+    source_device_id = (source_device_id or "").strip()
+    client_id = (client_id or "").strip()
+    if not source_device_id and not client_id:
+        return None
+    identities = [value for value in (source_device_id, client_id) if value]
+    placeholders = ",".join("?" for _ in identities)
+    return conn.execute(
+        f"""
+        SELECT * FROM devices
+        WHERE source_device_id IN ({placeholders}) OR client_id IN ({placeholders})
+        ORDER BY id LIMIT 1
+        """,
+        (*identities, *identities),
+    ).fetchone()
+
+
+def _generate_unique_device_code(conn: sqlite3.Connection) -> str:
+    for _ in range(20):
+        device_code = f"{uuid.uuid4().int % 1000000:06d}"
+        if not conn.execute("SELECT 1 FROM devices WHERE device_code = ?", (device_code,)).fetchone():
+            return device_code
+    raise ValueError("无法生成唯一设备码")
+
+
+def _claimable_seed_device_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    row = conn.execute(
+        """
+        SELECT d.* FROM devices d
+        JOIN user_device_bindings b ON b.device_id = d.id
+        WHERE d.id = ?
+          AND COALESCE(d.source_device_id, '') = ''
+          AND COALESCE(d.client_id, '') = ''
+        LIMIT 1
+        """,
+        (DEMO_DEVICE_ID,),
+    ).fetchone()
+    return row
+
+
+def _insert_device(
+    conn: sqlite3.Connection,
+    device_code: str | None = None,
+    display_name: str | None = None,
+    source_device_id: str | None = None,
+    client_id: str | None = None,
+    model: str | None = None,
+    firmware_version: str | None = None,
+    online_status: str = "unknown",
+) -> sqlite3.Row:
+    clean_code = (device_code or "").strip() or _generate_unique_device_code(conn)
+    if conn.execute("SELECT 1 FROM devices WHERE device_code = ?", (clean_code,)).fetchone():
+        raise ValueError("device_code 已存在")
+
+    clean_display_name = (display_name or "我的白泽").strip() or "我的白泽"
+    clean_version = (firmware_version or "0.1.0-demo").strip() or "0.1.0-demo"
+    device_id = f"baize_{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        """
+        INSERT INTO devices(
+            id, device_code, display_name, source_device_id, client_id, model,
+            online_status, firmware_version, current_version, latest_version,
+            update_available, release_note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """,
+        (
+            device_id,
+            clean_code,
+            clean_display_name,
+            (source_device_id or "").strip() or None,
+            (client_id or "").strip() or None,
+            (model or "").strip() or None,
+            online_status,
+            clean_version,
+            clean_version,
+            clean_version,
+            f"设备当前版本 {clean_version}",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO device_settings(device_id, baize_nickname, user_call_name, personality_mode, tts_voice)
+        VALUES (?, '白泽', '小伙伴', 'curious', 'Sambert 知颖')
+        """,
+        (device_id,),
+    )
+    return conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
 
 
 def resolve_bound_app_device(
@@ -1651,8 +1731,29 @@ def update_device_report(
     ensure_db(db_path)
     reported_at = now_iso()
     with _connect(db_path) as conn:
-        device_id = _device_id_for_source(conn, source_device_id)
-        row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        row = _find_device_row_for_source(conn, source_device_id=source_device_id, client_id=client_id)
+        should_auto_bind_all_users = False
+        if row is None:
+            if (source_device_id or "").strip() or (client_id or "").strip():
+                row = _claimable_seed_device_row(conn)
+                if row is None:
+                    row = _insert_device(
+                        conn,
+                        display_name="我的白泽",
+                        source_device_id=source_device_id,
+                        client_id=client_id,
+                        model=model,
+                        firmware_version=firmware_version,
+                        online_status="online",
+                    )
+                    should_auto_bind_all_users = demo_auto_bind_new_devices_to_all_users(config)
+                else:
+                    should_auto_bind_all_users = demo_auto_bind_new_devices_to_all_users(config)
+            else:
+                row = conn.execute("SELECT * FROM devices WHERE id = ?", (DEMO_DEVICE_ID,)).fetchone()
+        device_id = row["id"]
+        if should_auto_bind_all_users:
+            _bind_device_to_all_users(conn, device_id)
         clean_battery = max(0, min(100, int(battery_percent))) if battery_percent is not None else row["battery_percent"]
         clean_version = firmware_version or row["firmware_version"]
         latest_version = firmware_version if firmware_version and not row["update_available"] else row["latest_version"]

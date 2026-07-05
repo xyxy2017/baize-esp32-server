@@ -105,7 +105,9 @@ class DeviceMCPHandlerTest(unittest.IsolatedAsyncioTestCase):
             ):
                 await _refresh_device_status_report(conn, mcp_client)
 
-            device = load_state(state_path)["devices"]["baize_dev_001"]
+            devices = load_state(state_path)["devices"]
+            device = next(item for item in devices.values() if item["source_device_id"] == "68:ee:8f:5c:71:54")
+            self.assertRegex(device["device_code"], r"^\d{6}$")
             self.assertEqual(device["battery_percent"], 77)
 
     async def test_mcp_server_info_updates_app_device_status(self):
@@ -130,7 +132,9 @@ class DeviceMCPHandlerTest(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-            device = load_state(state_path)["devices"]["baize_dev_001"]
+            devices = load_state(state_path)["devices"]
+            device = next(item for item in devices.values() if item["source_device_id"] == "68:ee:8f:5c:71:54")
+            self.assertRegex(device["device_code"], r"^\d{6}$")
             self.assertEqual(device["source_device_id"], "68:ee:8f:5c:71:54")
             self.assertEqual(device["client_id"], "client-mcp-001")
             self.assertEqual(device["model"], "zhengchen_eye")

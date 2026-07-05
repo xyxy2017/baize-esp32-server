@@ -953,16 +953,10 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(payload["items"][0]["baize_text"], "我是白泽幼灵呀。")
 
     @unittest_run_loop
-    async def test_device_report_updates_app_device_and_ota_status_without_marking_control_online(self):
+    async def test_device_report_auto_creates_bindable_device_code_for_first_online_device(self):
         from core.api.app_demo_store import update_device_report
 
-        await self.client.post(
-            "/api/app/devices/bind",
-            data=json.dumps({"device_code": "123456"}),
-            headers={**self.auth_headers(), "Content-Type": "application/json"},
-        )
-
-        update_device_report(
+        created = update_device_report(
             {"app_demo": {"state_path": self.state_path}},
             source_device_id="68:ee:8f:5c:71:54",
             client_id="client-001",
@@ -970,19 +964,38 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             firmware_version="1.2.3",
         )
 
+        self.assertNotEqual(created["id"], "baize_dev_001")
+        self.assertRegex(created["device_code"], r"^\d{6}$")
+        self.assertEqual(created["online_status"], "online")
+        self.assertEqual(created["firmware_version"], "1.2.3")
+        self.assertEqual(created["source_device_id"], "68:ee:8f:5c:71:54")
+        self.assertEqual(created["client_id"], "client-001")
+        self.assertEqual(created["model"], "baize-s3-eye")
+
+        bind_response = await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": created["device_code"]}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(bind_response.status, 200)
+        self.registry.connections["68:ee:8f:5c:71:54"] = types.SimpleNamespace(
+            device_id="68:ee:8f:5c:71:54",
+            headers={"client-id": "client-001"},
+        )
+
         detail_response = await self.client.get(
-            "/api/app/devices/baize_dev_001", headers=self.auth_headers()
+            f"/api/app/devices/{created['id']}", headers=self.auth_headers()
         )
         self.assertEqual(detail_response.status, 200)
         detail = await detail_response.json()
-        self.assertEqual(detail["online_status"], "offline")
+        self.assertEqual(detail["online_status"], "online")
         self.assertEqual(detail["firmware_version"], "1.2.3")
         self.assertEqual(detail["source_device_id"], "68:ee:8f:5c:71:54")
         self.assertEqual(detail["client_id"], "client-001")
         self.assertEqual(detail["model"], "baize-s3-eye")
 
         ota_response = await self.client.get(
-            "/api/app/devices/baize_dev_001/ota", headers=self.auth_headers()
+            f"/api/app/devices/{created['id']}/ota", headers=self.auth_headers()
         )
         self.assertEqual(ota_response.status, 200)
         ota = await ota_response.json()
@@ -992,13 +1005,53 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(ota["release_note"], "设备当前版本 1.2.3")
 
     @unittest_run_loop
-    async def test_ota_report_updates_app_device_status(self):
-        await self.client.post(
-            "/api/app/devices/bind",
-            data=json.dumps({"device_code": "123456"}),
-            headers={**self.auth_headers(), "Content-Type": "application/json"},
+    async def test_demo_auto_binds_first_online_device_to_all_existing_ios_accounts(self):
+        from core.api.app_demo_store import update_device_report
+
+        alice_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138003", "password": "secret1", "nickname": "Alice"}),
+            headers={"Content-Type": "application/json"},
+        )
+        bob_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138004", "password": "secret1", "nickname": "Bob"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(alice_response.status, 200)
+        self.assertEqual(bob_response.status, 200)
+        alice_token = (await alice_response.json())["token"]
+        bob_token = (await bob_response.json())["token"]
+
+        created = update_device_report(
+            self.config,
+            source_device_id="68:ee:8f:5c:71:55",
+            client_id="client-demo-bind-all",
+            model="baize-s3-eye",
+            firmware_version="1.2.4",
+            battery_percent=88,
         )
 
+        for token in (DEMO_TOKEN, alice_token, bob_token):
+            list_response = await self.client.get(
+                "/api/app/devices",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(list_response.status, 200)
+            payload = await list_response.json()
+            self.assertTrue(any(item["id"] == created["id"] for item in payload["items"]))
+
+        detail_response = await self.client.get(
+            f"/api/app/devices/{created['id']}",
+            headers={"Authorization": f"Bearer {bob_token}"},
+        )
+        self.assertEqual(detail_response.status, 200)
+        detail = await detail_response.json()
+        self.assertEqual(detail["source_device_id"], "68:ee:8f:5c:71:55")
+        self.assertEqual(detail["battery_percent"], 88)
+
+    @unittest_run_loop
+    async def test_ota_report_updates_app_device_status(self):
         ota_response = await self.client.post(
             "/xiaozhi/ota/",
             data=json.dumps(
@@ -1015,9 +1068,30 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         )
         self.assertEqual(ota_response.status, 200)
 
-        detail_response = await self.client.get(
-            "/api/app/devices/baize_dev_001", headers=self.auth_headers()
+        admin_login_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138001", "password": "secret1", "nickname": "Admin"}),
+            headers={"Content-Type": "application/json"},
         )
+        admin_token = (await admin_login_response.json())["token"]
+        admin_response = await self.client.get(
+            "/api/app/admin/devices", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+        devices = (await admin_response.json())["items"]
+        real_device = next(item for item in devices if item["source_device_id"] == "68:ee:8f:5c:71:54")
+        self.assertRegex(real_device["device_code"], r"^\d{6}$")
+
+        bind_response = await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": real_device["device_code"]}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(bind_response.status, 200)
+
+        detail_response = await self.client.get(
+            f"/api/app/devices/{real_device['id']}", headers=self.auth_headers()
+        )
+        self.assertEqual(detail_response.status, 200)
         detail = await detail_response.json()
         self.assertEqual(detail["firmware_version"], "2.0.1")
         self.assertEqual(detail["source_device_id"], "68:ee:8f:5c:71:54")
