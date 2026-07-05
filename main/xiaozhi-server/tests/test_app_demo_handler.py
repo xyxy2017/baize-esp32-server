@@ -81,7 +81,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
                 "websocket": "ws://127.0.0.1:8000/xiaozhi/v1/",
             },
             "app_demo": {"state_path": state_path},
-            "app_mvp": {"admin_phones": ["13800138001"]},
+            "app_mvp": {"admin_phones": ["13800138001"], "firmware_bin_dir": self.bin_dir},
             "firmware_cache_ttl": 30,
             "prompt": "你是白泽幼灵，来自上古神话世界，是神兽白泽的幼年形态。你默认称呼用户为小伙伴，也可以偶尔使用朋友或伙伴，不使用主人称呼。",
             "prompt_template": str(prompt_template_path),
@@ -113,6 +113,21 @@ class AppDemoHandlerTest(AioHTTPTestCase):
                         await result
 
         self.registry = _FakeRegistry()
+
+        class _FakeWebSocket:
+            def __init__(inner_self):
+                inner_self.sent = []
+
+            async def send(inner_self, message):
+                inner_self.sent.append(message)
+
+        class _FakeConnection:
+            def __init__(inner_self, device_id, client_id):
+                inner_self.device_id = device_id
+                inner_self.headers = {"client-id": client_id}
+                inner_self.websocket = _FakeWebSocket()
+
+        self.fake_connection_class = _FakeConnection
 
         async def fake_status_refresher(conn):
             self.refreshed_connections.append(conn)
@@ -1263,6 +1278,88 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(app_ota["latest_version"], "2.1.0")
         self.assertTrue(app_ota["update_available"])
         self.assertIn("发现可用固件版本 2.1.0", app_ota["release_note"])
+
+    @unittest_run_loop
+    async def test_app_ota_payload_scans_uploaded_firmware_without_device_ota_check(self):
+        from core.api.app_demo_store import update_device_report
+
+        Path(self.bin_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.bin_dir, "zhengchen_eye_1.8.7.bin").write_bytes(b"demo firmware")
+        created = update_device_report(
+            self.config,
+            source_device_id="68:ee:8f:5c:71:54",
+            client_id="client-ota-001",
+            model="zhengchen_eye",
+            firmware_version="1.8.6",
+            battery_percent=88,
+        )
+
+        app_ota_response = await self.client.get(
+            f"/api/app/devices/{created['id']}/ota", headers=self.auth_headers()
+        )
+        self.assertEqual(app_ota_response.status, 200)
+        app_ota = await app_ota_response.json()
+        self.assertEqual(app_ota["current_version"], "1.8.6")
+        self.assertEqual(app_ota["latest_version"], "1.8.7")
+        self.assertTrue(app_ota["update_available"])
+
+    @unittest_run_loop
+    async def test_app_ota_upgrade_sends_reboot_command_to_online_device(self):
+        from core.api.app_demo_store import update_device_report
+
+        Path(self.bin_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.bin_dir, "zhengchen_eye_1.8.7.bin").write_bytes(b"demo firmware")
+        created = update_device_report(
+            self.config,
+            source_device_id="68:ee:8f:5c:71:54",
+            client_id="client-ota-001",
+            model="zhengchen_eye",
+            firmware_version="1.8.6",
+            battery_percent=88,
+        )
+        conn = self.fake_connection_class("68:ee:8f:5c:71:54", "client-ota-001")
+        self.registry.connections["68:ee:8f:5c:71:54"] = conn
+        self.registry.connections["client-ota-001"] = conn
+
+        upgrade_response = await self.client.post(
+            f"/api/app/devices/{created['id']}/ota/upgrade",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(upgrade_response.status, 200)
+        payload = await upgrade_response.json()
+        self.assertTrue(payload["requested"])
+        self.assertTrue(payload["device_online"])
+        self.assertEqual(payload["ota"]["latest_version"], "1.8.7")
+        self.assertEqual(len(conn.websocket.sent), 1)
+        self.assertEqual(json.loads(conn.websocket.sent[0])["type"], "system")
+        self.assertEqual(json.loads(conn.websocket.sent[0])["command"], "reboot")
+
+    @unittest_run_loop
+    async def test_app_ota_upgrade_reports_offline_device_without_error(self):
+        from core.api.app_demo_store import update_device_report
+
+        Path(self.bin_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.bin_dir, "zhengchen_eye_1.8.7.bin").write_bytes(b"demo firmware")
+        created = update_device_report(
+            self.config,
+            source_device_id="68:ee:8f:5c:71:54",
+            client_id="client-ota-001",
+            model="zhengchen_eye",
+            firmware_version="1.8.6",
+            battery_percent=88,
+        )
+
+        upgrade_response = await self.client.post(
+            f"/api/app/devices/{created['id']}/ota/upgrade",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(upgrade_response.status, 200)
+        payload = await upgrade_response.json()
+        self.assertFalse(payload["requested"])
+        self.assertFalse(payload["device_online"])
+        self.assertIn("不在线", payload["message"])
 
     @unittest_run_loop
     async def test_debug_chat_uses_current_prompt_and_writes_dialogue(self):

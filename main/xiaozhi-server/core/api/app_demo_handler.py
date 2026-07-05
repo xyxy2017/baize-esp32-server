@@ -104,6 +104,7 @@ class AppDemoHandler(BaseHandler):
             web.get("/api/app/devices/{device_id}/diaries", self.handle_diaries),
             web.post("/api/app/devices/{device_id}/diaries/generate", self.handle_generate_diary),
             web.get("/api/app/devices/{device_id}/ota", self.handle_ota),
+            web.post("/api/app/devices/{device_id}/ota/upgrade", self.handle_ota_upgrade),
             web.post("/api/app/devices/{device_id}/refresh-status", self.handle_refresh_status),
             web.post("/api/app/devices/{device_id}/demo/run", self.handle_demo_run),
             web.post("/api/app/devices/{device_id}/unbind", self.handle_unbind_device),
@@ -451,6 +452,55 @@ class AppDemoHandler(BaseHandler):
         if isinstance(device_or_response, web.Response):
             return device_or_response
         return self._json_response(ota_payload(self.config, user["id"], device_or_response["id"]))
+
+    async def handle_ota_upgrade(self, request):
+        user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+        ota = ota_payload(self.config, user["id"], device_or_response["id"])
+        if not ota:
+            return self._error_response("设备不存在或未绑定", status=404)
+        if not ota.get("update_available"):
+            return self._json_response(
+                {
+                    "requested": False,
+                    "device_online": False,
+                    "message": "当前已经是最新版本",
+                    "ota": ota,
+                }
+            )
+        conn = self._find_active_connection(device_or_response)
+        if conn is None:
+            return self._json_response(
+                {
+                    "requested": False,
+                    "device_online": False,
+                    "message": "白泽当前不在线，开机联网后会自动检查升级",
+                    "ota": ota,
+                }
+            )
+        try:
+            await conn.websocket.send(
+                json.dumps(
+                    {
+                        "type": "system",
+                        "command": "reboot",
+                        "reason": "ota_upgrade_requested",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"发送 OTA 升级指令失败: {e}")
+            return self._error_response("发送 OTA 升级指令失败", status=502)
+        return self._json_response(
+            {
+                "requested": True,
+                "device_online": True,
+                "message": "已通知白泽重启并检查 OTA 升级",
+                "ota": ota,
+            }
+        )
 
     async def handle_connection_diagnostic(self, request):
         user, device_or_response = self._get_bound_device_or_response(request)

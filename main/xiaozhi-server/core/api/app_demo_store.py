@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import sqlite3
 import uuid
+import glob
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -104,6 +105,47 @@ def app_mvp_db_path_from_config(config: dict) -> str:
 
 def state_path_from_config(config: dict) -> str:
     return app_mvp_db_path_from_config(config)
+
+
+def firmware_bin_dir_from_config(config: dict) -> str:
+    return config.get("app_mvp", {}).get("firmware_bin_dir") or os.path.join(os.getcwd(), "data", "bin")
+
+
+def _parse_firmware_version(version: str) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", version or "")
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def _is_higher_firmware_version(candidate: str, current: str) -> bool:
+    candidate_parts = _parse_firmware_version(candidate)
+    current_parts = _parse_firmware_version(current)
+    max_length = max(len(candidate_parts), len(current_parts))
+    for index in range(max_length):
+        candidate_value = candidate_parts[index] if index < len(candidate_parts) else 0
+        current_value = current_parts[index] if index < len(current_parts) else 0
+        if candidate_value > current_value:
+            return True
+        if candidate_value < current_value:
+            return False
+    return False
+
+
+def latest_firmware_version_for_model(config: dict, model: str) -> str | None:
+    clean_model = (model or "").strip()
+    if not clean_model:
+        return None
+    bin_dir = firmware_bin_dir_from_config(config)
+    pattern = os.path.join(bin_dir, f"{clean_model}_*.bin")
+    versions = []
+    for path in glob.glob(pattern):
+        filename = os.path.basename(path)
+        match = re.match(rf"^{re.escape(clean_model)}_([0-9][A-Za-z0-9\.\-_]*)\.bin$", filename)
+        if match:
+            versions.append(match.group(1))
+    if not versions:
+        return None
+    versions.sort(key=_parse_firmware_version, reverse=True)
+    return versions[0]
 
 
 def db_path_from_state_path(path: str) -> str:
@@ -1759,12 +1801,20 @@ def ota_payload(config: dict, user_id: str, device_id: str) -> Dict[str, Any] | 
         if not _is_bound_conn(conn, user_id, device_id):
             return None
         row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        current_version = row["current_version"] or row["firmware_version"]
+        latest_version = latest_firmware_version_for_model(config, row["model"]) or row["latest_version"] or current_version
+        update_available = _is_higher_firmware_version(latest_version, current_version)
+        release_note = (
+            f"发现可用固件版本 {latest_version}"
+            if update_available
+            else f"设备当前版本 {current_version}"
+        )
         return {
             "device_id": row["id"],
-            "current_version": row["current_version"],
-            "latest_version": row["latest_version"],
-            "update_available": bool(row["update_available"]),
-            "release_note": row["release_note"],
+            "current_version": current_version,
+            "latest_version": latest_version,
+            "update_available": update_available,
+            "release_note": release_note,
         }
 
 
