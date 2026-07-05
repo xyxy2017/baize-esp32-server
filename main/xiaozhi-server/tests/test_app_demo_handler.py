@@ -686,6 +686,35 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(payload["items"][0]["source_device_id"], "68:ee:8f:5c:71:54")
 
     @unittest_run_loop
+    async def test_demo_bound_users_can_read_shared_real_device_dialogues(self):
+        from core.api.app_demo_store import append_dialogue
+
+        await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": "123456"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+
+        append_dialogue(
+            {"app_demo": {"state_path": self.state_path}},
+            source_device_id="68:ee:8f:5c:71:54",
+            session_id="session-shared",
+            user_id="first_bound_test_user",
+            user_text="我前面有跟你聊过天吗？",
+            baize_text="嗯，聊过的呀。今天我们还一起调试了日记功能。",
+            emotion="thinking",
+        )
+
+        response = await self.client.get(
+            "/api/app/devices/baize_dev_001/dialogues", headers=self.auth_headers()
+        )
+
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["items"][0]["user_text"], "我前面有跟你聊过天吗？")
+        self.assertEqual(payload["items"][0]["source_device_id"], "68:ee:8f:5c:71:54")
+
+    @unittest_run_loop
     async def test_dialogues_infer_emotion_from_baize_emoji_prefix(self):
         from core.api.app_demo_store import append_dialogue
 
@@ -817,6 +846,36 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(list_response.status, 200)
         payload = await list_response.json()
         self.assertEqual(payload["items"][0]["id"], diary["id"])
+
+    @unittest_run_loop
+    async def test_generate_diary_uses_shared_real_device_dialogues_in_demo_mode(self):
+        from core.api.app_demo_store import append_dialogue
+
+        await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": "123456"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+
+        append_dialogue(
+            {"app_demo": {"state_path": self.state_path}},
+            source_device_id="68:ee:8f:5c:71:54",
+            session_id="session-shared-diary",
+            user_id="first_bound_test_user",
+            user_text="日记功能现在在做也有。",
+            baize_text="日记功能在做呀，那太好了！",
+            emotion="happy",
+        )
+
+        response = await self.client.post(
+            "/api/app/devices/baize_dev_001/diaries/generate",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(response.status, 200)
+        diary = await response.json()
+        self.assertEqual(diary["dialogue_count"], 1)
+        self.assertIn("日记功能", diary["summary"])
 
     @unittest_run_loop
     async def test_generate_diary_prefers_meaningful_events_over_asr_noise(self):

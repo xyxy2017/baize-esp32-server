@@ -1003,6 +1003,11 @@ def _first_bound_user_for_device(conn: sqlite3.Connection, device_id: str) -> st
     return row["user_id"] if row else DEMO_USER_ID
 
 
+def _shared_device_dialogues_enabled(config: dict) -> bool:
+    """Demo mode: a real test device is visible to every bound iOS account."""
+    return demo_auto_bind_new_devices_to_all_users(config)
+
+
 def _device_id_for_source(conn: sqlite3.Connection, source_device_id: str) -> str:
     if source_device_id:
         row = conn.execute(
@@ -1198,26 +1203,52 @@ def list_dialogues(config: dict, user_id: str, device_id: str) -> list[Dict[str,
     with _connect(db_path) as conn:
         if not _is_bound_conn(conn, user_id, device_id):
             return None
+        if _shared_device_dialogues_enabled(config):
+            rows = conn.execute(
+                """
+                SELECT * FROM dialogues
+                WHERE device_id = ?
+                ORDER BY created_at DESC LIMIT 100
+                """,
+                (device_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM dialogues
+                WHERE user_id = ? AND device_id = ?
+                ORDER BY created_at DESC LIMIT 100
+                """,
+                (user_id, device_id),
+            ).fetchall()
+        return [dict(row) for row in rows if not is_legacy_xiaozhi_dialogue(dict(row))]
+
+
+def _dialogues_for_date(
+    conn: sqlite3.Connection,
+    user_id: str,
+    device_id: str,
+    diary_date: str,
+    shared_device_dialogues: bool = False,
+) -> list[Dict[str, Any]]:
+    if shared_device_dialogues:
+        rows = conn.execute(
+            """
+            SELECT * FROM dialogues
+            WHERE device_id = ?
+            ORDER BY created_at ASC
+            """,
+            (device_id,),
+        ).fetchall()
+    else:
         rows = conn.execute(
             """
             SELECT * FROM dialogues
             WHERE user_id = ? AND device_id = ?
-            ORDER BY created_at DESC LIMIT 100
+            ORDER BY created_at ASC
             """,
             (user_id, device_id),
         ).fetchall()
-        return [dict(row) for row in rows if not is_legacy_xiaozhi_dialogue(dict(row))]
-
-
-def _dialogues_for_date(conn: sqlite3.Connection, user_id: str, device_id: str, diary_date: str) -> list[Dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT * FROM dialogues
-        WHERE user_id = ? AND device_id = ?
-        ORDER BY created_at ASC
-        """,
-        (user_id, device_id),
-    ).fetchall()
     return [dict(row) for row in rows if _date_from_iso(row["created_at"]) == diary_date]
 
 
@@ -1489,17 +1520,28 @@ def generate_diary(
     with _connect(db_path) as conn:
         device_id = device_id or DEMO_DEVICE_ID
         user_id = user_id or _first_bound_user_for_device(conn, device_id)
+        shared_device_dialogues = _shared_device_dialogues_enabled(config) and _is_bound_conn(conn, user_id, device_id)
         if diary_date is None:
-            latest = conn.execute(
-                """
-                SELECT created_at FROM dialogues
-                WHERE user_id = ? AND device_id = ?
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (user_id, device_id),
-            ).fetchone()
+            if shared_device_dialogues:
+                latest = conn.execute(
+                    """
+                    SELECT created_at FROM dialogues
+                    WHERE device_id = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (device_id,),
+                ).fetchone()
+            else:
+                latest = conn.execute(
+                    """
+                    SELECT created_at FROM dialogues
+                    WHERE user_id = ? AND device_id = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (user_id, device_id),
+                ).fetchone()
             diary_date = _date_from_iso(latest["created_at"]) if latest else today_key()
-        dialogues = _dialogues_for_date(conn, user_id, device_id, diary_date)
+        dialogues = _dialogues_for_date(conn, user_id, device_id, diary_date, shared_device_dialogues)
         if not dialogues:
             return {}
         quotes = [
