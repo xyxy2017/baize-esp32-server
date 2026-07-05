@@ -31,6 +31,7 @@ from core.api.app_demo_store import (
     ota_payload,
     register_phone_user,
     register_or_login_user,
+    resolve_bound_app_device,
     rotate_device_code,
     state_path_from_config,
     unbind_device,
@@ -67,6 +68,9 @@ class AppDemoHandler(BaseHandler):
         self.device_registry = device_registry
         self.mcp_status_refresher = mcp_status_refresher or self._refresh_status_from_connection
         self.demo_runner = demo_runner or self._run_demo_on_connection
+        self._event_subscribers = {}
+        if self.device_registry is not None and hasattr(self.device_registry, "subscribe"):
+            self.device_registry.subscribe(self._handle_registry_event)
 
     def routes(self):
         return [
@@ -94,6 +98,7 @@ class AppDemoHandler(BaseHandler):
             web.delete("/api/app/devices/{device_id}/memories/{memory_id}", self.handle_delete_memory),
             web.post("/api/app/devices/{device_id}/debug/chat", self.handle_debug_chat),
             web.get("/api/app/devices/{device_id}/connection", self.handle_connection_diagnostic),
+            web.get("/api/app/devices/{device_id}/events", self.handle_device_events),
             web.get("/api/app/devices/{device_id}/dialogues", self.handle_dialogues),
             web.get("/api/app/devices/{device_id}/diaries", self.handle_diaries),
             web.post("/api/app/devices/{device_id}/diaries/generate", self.handle_generate_diary),
@@ -470,6 +475,33 @@ class AppDemoHandler(BaseHandler):
             }
         )
 
+    async def handle_device_events(self, request):
+        user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+
+        device_id = device_or_response["id"]
+        queue = asyncio.Queue()
+        self._event_subscribers.setdefault(device_id, set()).add(queue)
+        try:
+            await ws.send_json(self._device_event(device_or_response, "device.status.snapshot"))
+            while not ws.closed:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                except asyncio.TimeoutError:
+                    continue
+                await ws.send_json(event)
+        finally:
+            subscribers = self._event_subscribers.get(device_id)
+            if subscribers is not None:
+                subscribers.discard(queue)
+                if not subscribers:
+                    self._event_subscribers.pop(device_id, None)
+        return ws
+
     async def handle_refresh_status(self, request):
         user, device_or_response = self._get_bound_device_or_response(request)
         if isinstance(device_or_response, web.Response):
@@ -556,13 +588,17 @@ class AppDemoHandler(BaseHandler):
             "client_id",
             "model",
             "online_status",
+            "activity_status",
             "battery_percent",
             "firmware_version",
             "last_online_at",
         )
         payload = {field: device.get(field) for field in fields}
         if self._has_real_device_identity(device) and self.device_registry is not None:
-            payload["online_status"] = "online" if self._find_active_connection(device) is not None else "offline"
+            conn = self._find_active_connection(device)
+            payload["online_status"] = "online" if conn is not None else "offline"
+            if conn is not None and getattr(conn, "activity_status", None):
+                payload["activity_status"] = getattr(conn, "activity_status")
         return payload
 
     def _has_real_device_identity(self, device: Dict[str, Any]) -> bool:
@@ -587,6 +623,28 @@ class AppDemoHandler(BaseHandler):
             raise RuntimeError("设备连接没有 MCP 客户端")
         await _refresh_device_status_report(conn, mcp_client)
         return getattr(conn, "battery_percent", None)
+
+    async def _handle_registry_event(self, event_type: str, conn) -> None:
+        device = resolve_bound_app_device(
+            self.config,
+            source_device_id=getattr(conn, "device_id", "") or "",
+            client_id=getattr(conn, "headers", {}).get("client-id", ""),
+        )
+        if not device:
+            return
+        await self._broadcast_device_event(device["id"], self._device_event(device, "device.status.updated"))
+
+    def _device_event(self, device: Dict[str, Any], event_type: str) -> Dict[str, Any]:
+        return {
+            "type": event_type,
+            "device_id": device["id"],
+            "device": self._device_payload(device),
+        }
+
+    async def _broadcast_device_event(self, device_id: str, event: Dict[str, Any]) -> None:
+        queues = list(self._event_subscribers.get(device_id, set()))
+        for queue in queues:
+            queue.put_nowait(event)
 
     async def _run_demo_on_connection(self, conn, prompt: str):
         loop = asyncio.get_running_loop()

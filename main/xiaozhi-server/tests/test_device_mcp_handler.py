@@ -34,6 +34,7 @@ sys.modules.setdefault("opuslib_next", types.ModuleType("opuslib_next"))
 from core.api.app_demo_store import load_state
 from core.providers.tools.device_mcp.mcp_handler import (
     MCPClient,
+    _extract_activity_status,
     _extract_battery_percent,
     _refresh_device_status_report,
     handle_mcp_message,
@@ -82,6 +83,24 @@ class DeviceMCPHandlerTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(_extract_battery_percent({"screen": {"brightness": 30}}))
 
+    def test_extracts_activity_status_from_device_status_payloads(self):
+        self.assertEqual(_extract_activity_status({"device_state": "idle"}), "idle")
+        self.assertEqual(_extract_activity_status({"state": "speaking"}), "speaking")
+        self.assertEqual(
+            _extract_activity_status(
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": '{"device_state":"idle","battery":{"level":100,"charging":false}}',
+                        }
+                    ],
+                    "isError": False,
+                }
+            ),
+            "idle",
+        )
+
     async def test_refresh_device_status_report_writes_battery_percent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = str(Path(temp_dir) / "state.json")
@@ -97,7 +116,7 @@ class DeviceMCPHandlerTest(unittest.IsolatedAsyncioTestCase):
             )
 
             async def fake_call_tool(*_args, **_kwargs):
-                return "当前电量为 77%"
+                return '{"battery":{"level":77},"device_state":"idle"}'
 
             with patch(
                 "core.providers.tools.device_mcp.mcp_handler.call_mcp_tool",
@@ -109,6 +128,8 @@ class DeviceMCPHandlerTest(unittest.IsolatedAsyncioTestCase):
             device = next(item for item in devices.values() if item["source_device_id"] == "68:ee:8f:5c:71:54")
             self.assertRegex(device["device_code"], r"^\d{6}$")
             self.assertEqual(device["battery_percent"], 77)
+            self.assertEqual(device["activity_status"], "idle")
+            self.assertEqual(conn.activity_status, "idle")
 
     async def test_mcp_server_info_updates_app_device_status(self):
         with tempfile.TemporaryDirectory() as temp_dir:

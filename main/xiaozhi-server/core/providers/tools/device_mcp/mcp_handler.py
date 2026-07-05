@@ -69,6 +69,85 @@ def _extract_battery_percent(value):
     return None
 
 
+def _normalize_activity_status(value):
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "kdevicestateidle": "idle",
+        "idle": "idle",
+        "standby": "idle",
+        "sleep": "idle",
+        "sleeping": "idle",
+        "resting": "idle",
+        "待命": "idle",
+        "待机": "idle",
+        "小憩": "idle",
+        "kdevicatelistening": "listening",
+        "kdevicestatelistening": "listening",
+        "listening": "listening",
+        "listen": "listening",
+        "聆听中": "listening",
+        "kdevicestatespeaking": "speaking",
+        "speaking": "speaking",
+        "speak": "speaking",
+        "说话中": "speaking",
+        "kdevicestateconnecting": "connecting",
+        "connecting": "connecting",
+        "kdevicestatestarting": "starting",
+        "starting": "starting",
+        "kdevicestateactivating": "activating",
+        "activating": "activating",
+        "kdevicestateupgrading": "upgrading",
+        "upgrading": "upgrading",
+        "kdevicestateaudiotesting": "audio_testing",
+        "audio_testing": "audio_testing",
+        "kdevicestatefatalerror": "fatal_error",
+        "fatal_error": "fatal_error",
+    }
+    return aliases.get(normalized)
+
+
+def _extract_activity_status(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                status = _extract_activity_status(json.loads(stripped))
+                if status is not None:
+                    return status
+            except Exception:
+                pass
+        return _normalize_activity_status(stripped)
+    if isinstance(value, list):
+        for item in value:
+            status = _extract_activity_status(item)
+            if status is not None:
+                return status
+        return None
+    if isinstance(value, dict):
+        preferred_keys = (
+            "activity_status",
+            "activityStatus",
+            "device_state",
+            "deviceState",
+            "current_state",
+            "currentState",
+            "state",
+        )
+        for key in preferred_keys:
+            if key in value:
+                status = _extract_activity_status(value[key])
+                if status is not None:
+                    return status
+        for item in value.values():
+            if isinstance(item, (dict, list, str)):
+                status = _extract_activity_status(item)
+                if status is not None:
+                    return status
+    return None
+
+
 class MCPClient:
     """设备端MCP客户端，用于管理MCP状态和工具"""
 
@@ -362,13 +441,19 @@ async def _refresh_device_status_report(conn: "ConnectionHandler", mcp_client: M
     try:
         result = await call_mcp_tool(conn, mcp_client, tool_name, "{}", timeout=5)
         battery_percent = _extract_battery_percent(result)
-        if battery_percent is None:
+        activity_status = _extract_activity_status(result)
+        if battery_percent is None and activity_status is None:
             return
+        if battery_percent is not None:
+            conn.battery_percent = battery_percent
+        if activity_status is not None:
+            conn.activity_status = activity_status
         update_device_report(
             conn.config,
             source_device_id=getattr(conn, "device_id", "") or "",
             client_id=getattr(conn, "headers", {}).get("client-id", ""),
             battery_percent=battery_percent,
+            activity_status=activity_status,
         )
     except Exception as e:
         logger.bind(tag=TAG).warning(f"刷新设备状态失败: {e}")

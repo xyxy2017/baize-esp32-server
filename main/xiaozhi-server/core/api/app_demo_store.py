@@ -190,6 +190,7 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
             model TEXT,
             online_status TEXT NOT NULL DEFAULT 'unknown',
             battery_percent INTEGER,
+            activity_status TEXT NOT NULL DEFAULT 'unknown',
             firmware_version TEXT NOT NULL DEFAULT '0.1.0-demo',
             last_online_at TEXT,
             current_version TEXT NOT NULL DEFAULT '0.1.0-demo',
@@ -316,6 +317,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL AND phone != ''")
     conn.execute("DROP INDEX IF EXISTS idx_bindings_device_unique")
+    device_columns = _table_columns(conn, "devices")
+    if "activity_status" not in device_columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN activity_status TEXT NOT NULL DEFAULT 'unknown'")
 
 
 def normalize_phone(phone: str | None) -> str:
@@ -774,6 +778,7 @@ def device_payload(row: sqlite3.Row) -> Dict[str, Any]:
         "client_id": row["client_id"],
         "model": row["model"],
         "online_status": row["online_status"],
+        "activity_status": row["activity_status"],
         "battery_percent": row["battery_percent"],
         "firmware_version": row["firmware_version"],
         "last_online_at": row["last_online_at"],
@@ -1062,6 +1067,7 @@ def _insert_device(
     model: str | None = None,
     firmware_version: str | None = None,
     online_status: str = "unknown",
+    activity_status: str = "unknown",
 ) -> sqlite3.Row:
     clean_code = (device_code or "").strip() or _generate_unique_device_code(conn)
     if conn.execute("SELECT 1 FROM devices WHERE device_code = ?", (clean_code,)).fetchone():
@@ -1074,9 +1080,9 @@ def _insert_device(
         """
         INSERT INTO devices(
             id, device_code, display_name, source_device_id, client_id, model,
-            online_status, firmware_version, current_version, latest_version,
+            online_status, activity_status, firmware_version, current_version, latest_version,
             update_available, release_note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
         """,
         (
             device_id,
@@ -1086,6 +1092,7 @@ def _insert_device(
             (client_id or "").strip() or None,
             (model or "").strip() or None,
             online_status,
+            activity_status,
             clean_version,
             clean_version,
             clean_version,
@@ -1726,6 +1733,7 @@ def update_device_report(
     model: str = "",
     firmware_version: str = "",
     battery_percent: int | None = None,
+    activity_status: str | None = None,
 ) -> Dict[str, Any]:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
@@ -1756,13 +1764,14 @@ def update_device_report(
             _bind_device_to_all_users(conn, device_id)
         clean_battery = max(0, min(100, int(battery_percent))) if battery_percent is not None else row["battery_percent"]
         clean_version = firmware_version or row["firmware_version"]
+        clean_activity_status = (activity_status or row["activity_status"] or "unknown").strip() or "unknown"
         latest_version = firmware_version if firmware_version and not row["update_available"] else row["latest_version"]
         release_note = f"设备当前版本 {firmware_version}" if firmware_version and not row["update_available"] else row["release_note"]
         conn.execute(
             """
             UPDATE devices
             SET source_device_id = ?, client_id = ?, model = ?, firmware_version = ?,
-                battery_percent = ?, online_status = 'online', last_online_at = ?,
+                battery_percent = ?, activity_status = ?, online_status = 'online', last_online_at = ?,
                 current_version = ?, latest_version = ?, release_note = ?
             WHERE id = ?
             """,
@@ -1772,6 +1781,7 @@ def update_device_report(
                 model or row["model"],
                 clean_version,
                 clean_battery,
+                clean_activity_status,
                 reported_at,
                 clean_version,
                 latest_version,
@@ -2012,11 +2022,12 @@ def save_state(path: str, state: Dict[str, Any]) -> None:
         for device_id, device in state.get("devices", {}).items():
             conn.execute(
                 """
-                INSERT INTO devices(id, device_code, display_name, online_status, battery_percent, firmware_version, last_online_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO devices(id, device_code, display_name, online_status, activity_status, battery_percent, firmware_version, last_online_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     display_name = excluded.display_name,
                     online_status = excluded.online_status,
+                    activity_status = excluded.activity_status,
                     battery_percent = excluded.battery_percent,
                     firmware_version = excluded.firmware_version,
                     last_online_at = excluded.last_online_at
@@ -2026,6 +2037,7 @@ def save_state(path: str, state: Dict[str, Any]) -> None:
                     device.get("device_code") or DEMO_DEVICE_CODE,
                     device.get("display_name") or "我的白泽",
                     device.get("online_status") or "unknown",
+                    device.get("activity_status") or "unknown",
                     device.get("battery_percent"),
                     device.get("firmware_version") or "0.1.0-demo",
                     device.get("last_online_at"),

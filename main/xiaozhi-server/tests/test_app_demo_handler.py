@@ -94,12 +94,22 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         class _FakeRegistry:
             def __init__(inner_self):
                 inner_self.connections = {}
+                inner_self.subscribers = []
 
             def get(inner_self, device_identifier):
                 return inner_self.connections.get(device_identifier)
 
             def active_identifiers(inner_self):
                 return sorted(inner_self.connections.keys())
+
+            def subscribe(inner_self, callback):
+                inner_self.subscribers.append(callback)
+
+            async def emit(inner_self, event_type, conn):
+                for callback in inner_self.subscribers:
+                    result = callback(event_type, conn)
+                    if hasattr(result, "__await__"):
+                        await result
 
         self.registry = _FakeRegistry()
 
@@ -548,6 +558,47 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         payload = await response.json()
         self.assertEqual(payload["battery_percent"], 66)
         self.assertEqual(self.refreshed_connections, [conn])
+
+    @unittest_run_loop
+    async def test_device_events_stream_pushes_connection_status_changes(self):
+        from core.api.app_demo_store import update_device_report
+
+        await self.bind_demo_device()
+        update_device_report(
+            self.config,
+            source_device_id="68:ee:8f:5c:71:54",
+            client_id="client-mcp-001",
+            firmware_version="1.8.5",
+            activity_status="idle",
+        )
+
+        ws = await self.client.ws_connect(
+            "/api/app/devices/baize_dev_001/events",
+            headers=self.auth_headers(),
+        )
+        initial = await ws.receive_json()
+        self.assertEqual(initial["type"], "device.status.snapshot")
+        self.assertEqual(initial["device"]["online_status"], "offline")
+
+        conn = types.SimpleNamespace(
+            device_id="68:ee:8f:5c:71:54",
+            headers={"client-id": "client-mcp-001"},
+            activity_status="idle",
+        )
+        self.registry.connections["68:ee:8f:5c:71:54"] = conn
+        await self.registry.emit("registered", conn)
+
+        online_event = await ws.receive_json()
+        self.assertEqual(online_event["type"], "device.status.updated")
+        self.assertEqual(online_event["device"]["online_status"], "online")
+        self.assertEqual(online_event["device"]["activity_status"], "idle")
+
+        self.registry.connections.pop("68:ee:8f:5c:71:54")
+        await self.registry.emit("unregistered", conn)
+
+        offline_event = await ws.receive_json()
+        self.assertEqual(offline_event["device"]["online_status"], "offline")
+        await ws.close()
 
     @unittest_run_loop
     async def test_demo_run_endpoint_sends_demo_prompt_to_active_device_connection(self):

@@ -22,12 +22,14 @@ set -e
 cd '${PROJECT_DIR}'
 ts=\$(date +%F-%H%M%S)
 backup_dir=\"backups/deploy-\${ts}\"
-mkdir -p \"\${backup_dir}/core/api\" \"\${backup_dir}/core\" \"\${backup_dir}/tests\" \"\${backup_dir}/scripts\" \"\${backup_dir}/deploy/systemd\"
+mkdir -p \"\${backup_dir}/core/api\" \"\${backup_dir}/core/providers/tools/device_mcp\" \"\${backup_dir}/core\" \"\${backup_dir}/tests\" \"\${backup_dir}/scripts\" \"\${backup_dir}/deploy/systemd\"
 cp -a core/api/app_demo_store.py \"\${backup_dir}/core/api/\" 2>/dev/null || true
 cp -a core/api/app_demo_handler.py \"\${backup_dir}/core/api/\" 2>/dev/null || true
 cp -a core/api/health_handler.py \"\${backup_dir}/core/api/\" 2>/dev/null || true
 cp -a core/api/ota_handler.py \"\${backup_dir}/core/api/\" 2>/dev/null || true
 cp -a core/http_server.py \"\${backup_dir}/core/\" 2>/dev/null || true
+cp -a core/device_registry.py \"\${backup_dir}/core/\" 2>/dev/null || true
+cp -a core/providers/tools/device_mcp/mcp_handler.py \"\${backup_dir}/core/providers/tools/device_mcp/\" 2>/dev/null || true
 cp -a tests/test_app_demo_handler.py \"\${backup_dir}/tests/\" 2>/dev/null || true
 cp -a tests/test_device_mcp_handler.py \"\${backup_dir}/tests/\" 2>/dev/null || true
 cp -a scripts/deploy_direct_python.sh \"\${backup_dir}/scripts/\" 2>/dev/null || true
@@ -46,7 +48,12 @@ scp \
 
 scp \
   core/http_server.py \
+  core/device_registry.py \
   "${REMOTE_HOST}:${PROJECT_DIR}/core/"
+
+scp \
+  core/providers/tools/device_mcp/mcp_handler.py \
+  "${REMOTE_HOST}:${PROJECT_DIR}/core/providers/tools/device_mcp/"
 
 scp \
   tests/test_app_demo_handler.py \
@@ -71,6 +78,7 @@ cd '${PROJECT_DIR}'
   core/api/health_handler.py \
   core/api/ota_handler.py \
   core/http_server.py \
+  core/device_registry.py \
   core/providers/tools/device_mcp/mcp_handler.py
 
 '${PYTHON_BIN}' -m unittest -v \
