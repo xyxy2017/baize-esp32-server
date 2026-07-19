@@ -54,6 +54,10 @@ class SimpleHttpServer:
                         [
                             web.get("/xiaozhi/ota/", self.ota_handler.handle_get),
                             web.post("/xiaozhi/ota/", self.ota_handler.handle_post),
+                            web.post(
+                                "/xiaozhi/ota/activate",
+                                self.ota_handler.handle_activate,
+                            ),
                             web.options(
                                 "/xiaozhi/ota/", self.ota_handler.handle_options
                             ),

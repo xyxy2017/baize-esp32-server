@@ -12,7 +12,11 @@ from aiohttp import web
 from core.auth import AuthManager
 from core.utils.util import get_local_ip, get_vision_url
 from core.api.base_handler import BaseHandler
-from core.api.app_demo_store import update_device_report, update_ota_report
+from core.api.app_demo_store import (
+    device_activation_state,
+    update_device_report,
+    update_ota_report,
+)
 
 TAG = __name__
 
@@ -149,6 +153,15 @@ class OTAHandler(BaseHandler):
             )
         return f"http://{local_ip}:{http_port}/xiaozhi/ota/download/{filename}"
 
+    def _device_activation_enabled(self) -> bool:
+        app_mvp = self.config.get("app_mvp", {}) or {}
+        return bool(app_mvp.get("device_activation_enabled", True))
+
+    def _activation_challenge(self, device_id: str, device_code: str) -> str:
+        secret = str(self.config.get("server", {}).get("auth_key", "baize-activation"))
+        content = f"{device_id}:{device_code}".encode("utf-8")
+        return hmac.new(secret.encode("utf-8"), content, hashlib.sha256).hexdigest()
+
     async def handle_post(self, request):
         """处理 OTA POST 请求
 
@@ -229,7 +242,7 @@ class OTAHandler(BaseHandler):
             if not device_version:
                 device_version = "0.0.0"
 
-            update_device_report(
+            device = update_device_report(
                 self.config,
                 source_device_id=device_id,
                 client_id=client_id,
@@ -247,6 +260,26 @@ class OTAHandler(BaseHandler):
                     "url": "",
                 },
             }
+
+            activation_state = device_activation_state(
+                self.config,
+                source_device_id=device_id,
+                client_id=client_id,
+            )
+            if (
+                self._device_activation_enabled()
+                and activation_state
+                and not activation_state["activated"]
+            ):
+                device_code = activation_state["device"].get("device_code") or device.get("device_code")
+                if device_code:
+                    return_json["activation"] = {
+                        "code": device_code,
+                        "message": "请打开白泽 App，输入 6 位激活码",
+                        "challenge": self._activation_challenge(device_id, device_code),
+                        "timeout_ms": 30000,
+                    }
+                    self.logger.bind(tag=TAG).info(f"设备 {device_id} 尚未绑定，下发激活码")
 
             # existing mqtt/websocket logic (unchanged)
             mqtt_gateway_endpoint = server_config.get("mqtt_gateway")
@@ -379,6 +412,49 @@ class OTAHandler(BaseHandler):
         finally:
             self._add_cors_headers(response)
             return response
+
+    async def handle_activate(self, request):
+        """Return the App binding state to public firmware activation polling."""
+        device_id = request.headers.get("device-id", "").strip()
+        client_id = request.headers.get("client-id", "").strip()
+        if not device_id and not client_id:
+            response = web.json_response(
+                {"success": False, "message": "device-id or client-id required"},
+                status=400,
+            )
+            self._add_cors_headers(response)
+            return response
+
+        state = device_activation_state(
+            self.config,
+            source_device_id=device_id,
+            client_id=client_id,
+        )
+        if state is None:
+            response = web.json_response(
+                {"success": False, "message": "device not registered"},
+                status=404,
+            )
+        elif state["activated"]:
+            response = web.json_response(
+                {
+                    "success": True,
+                    "activated": True,
+                    "device_id": state["device"]["id"],
+                },
+                status=200,
+            )
+        else:
+            response = web.json_response(
+                {
+                    "success": True,
+                    "activated": False,
+                    "device_id": state["device"]["id"],
+                },
+                status=202,
+            )
+        self._add_cors_headers(response)
+        return response
 
     async def handle_get(self, request):
         """处理 OTA GET 请求"""

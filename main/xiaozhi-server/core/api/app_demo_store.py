@@ -1099,7 +1099,7 @@ def demo_auto_bind_new_devices_to_all_users(config: dict) -> bool:
         return bool(app_mvp["demo_auto_bind_new_devices_to_all_users"])
     if "demo_auto_bind_new_devices_to_all_users" in app_demo:
         return bool(app_demo["demo_auto_bind_new_devices_to_all_users"])
-    return True
+    return False
 
 
 def _bind_device_to_all_users(conn: sqlite3.Connection, device_id: str) -> None:
@@ -2143,6 +2143,39 @@ def update_device_report(
         )
         conn.commit()
         return _legacy_device(conn, conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone())
+
+
+def device_activation_state(
+    config: dict,
+    source_device_id: str = "",
+    client_id: str = "",
+) -> Dict[str, Any] | None:
+    """Return whether a physical OTA device is bound to an App user."""
+    source_device_id = (source_device_id or "").strip()
+    client_id = (client_id or "").strip()
+    if not source_device_id and not client_id:
+        return None
+
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        row = _find_device_row_for_source(
+            conn,
+            source_device_id=source_device_id,
+            client_id=client_id,
+        )
+        if row is None:
+            return None
+        owner = conn.execute(
+            "SELECT user_id, bound_at FROM user_device_bindings WHERE device_id = ? ORDER BY bound_at LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        return {
+            "device": device_payload(row),
+            "activated": owner is not None,
+            "bound_user_id": owner["user_id"] if owner else None,
+            "bound_at": owner["bound_at"] if owner else None,
+        }
 
 
 def update_ota_report(config: dict, current_version: str, latest_version: str, update_available: bool, release_note: str) -> Dict[str, Any]:

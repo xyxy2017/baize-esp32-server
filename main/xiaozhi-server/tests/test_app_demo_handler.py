@@ -34,6 +34,14 @@ class _NoopLogger:
 logger_module.setup_logging = lambda: _NoopLogger()
 sys.modules.setdefault("config.logger", logger_module)
 sys.modules.setdefault("opuslib_next", types.ModuleType("opuslib_next"))
+pydub_module = types.ModuleType("pydub")
+pydub_module.AudioSegment = type("AudioSegment", (), {})
+sys.modules.setdefault("pydub", pydub_module)
+jwt_module = types.ModuleType("jwt")
+jwt_module.InvalidTokenError = type("InvalidTokenError", (Exception,), {})
+jwt_module.encode = lambda *_args, **_kwargs: "test-jwt"
+jwt_module.decode = lambda *_args, **_kwargs: {}
+sys.modules.setdefault("jwt", jwt_module)
 
 from core.api.app_demo_handler import AppDemoHandler, DEMO_TOKEN
 from core.api.health_handler import HealthHandler
@@ -127,7 +135,11 @@ class AppDemoHandlerTest(AioHTTPTestCase):
                 "websocket": "ws://127.0.0.1:8000/xiaozhi/v1/",
             },
             "app_demo": {"state_path": state_path},
-            "app_mvp": {"admin_phones": ["13800138001"], "firmware_bin_dir": self.bin_dir},
+            "app_mvp": {
+                "admin_phones": ["13800138001"],
+                "firmware_bin_dir": self.bin_dir,
+                "demo_auto_bind_new_devices_to_all_users": True,
+            },
             "firmware_cache_ttl": 30,
             "prompt": "你是白泽幼灵，来自上古神话世界，是神兽白泽的幼年形态。你默认称呼用户为小伙伴，也可以偶尔使用朋友或伙伴，不使用主人称呼。",
             "prompt_template": str(prompt_template_path),
@@ -205,7 +217,12 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         app = web.Application()
         app.add_routes(handler.routes())
         app.add_routes(health_handler.routes())
-        app.add_routes([web.post("/xiaozhi/ota/", ota_handler.handle_post)])
+        app.add_routes(
+            [
+                web.post("/xiaozhi/ota/", ota_handler.handle_post),
+                web.post("/xiaozhi/ota/activate", ota_handler.handle_activate),
+            ]
+        )
         return app
 
     def auth_headers(self):
@@ -1233,6 +1250,8 @@ class AppDemoHandlerTest(AioHTTPTestCase):
     async def test_demo_auto_binds_first_online_device_to_all_existing_ios_accounts(self):
         from core.api.app_demo_store import update_device_report
 
+        self.config["app_mvp"]["demo_auto_bind_new_devices_to_all_users"] = True
+
         alice_response = await self.client.post(
             "/api/app/register",
             data=json.dumps({"phone": "13800138003", "password": "secret1", "nickname": "Alice"}),
@@ -1274,6 +1293,79 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         detail = await detail_response.json()
         self.assertEqual(detail["source_device_id"], "68:ee:8f:5c:71:55")
         self.assertEqual(detail["battery_percent"], 88)
+
+    @unittest_run_loop
+    async def test_ota_activation_code_binds_current_app_user(self):
+        self.config["app_mvp"]["demo_auto_bind_new_devices_to_all_users"] = False
+
+        ota_response = await self.client.post(
+            "/xiaozhi/ota/",
+            data=json.dumps(
+                {
+                    "board": {"type": "baize-s3-eye"},
+                    "application": {"version": "2.0.1"},
+                }
+            ),
+            headers={
+                "device-id": "68:ee:8f:5c:71:99",
+                "client-id": "client-activation-001",
+                "activation-version": "1",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(ota_response.status, 200)
+        activation = (await ota_response.json())["activation"]
+        self.assertRegex(activation["code"], r"^\d{6}$")
+        self.assertEqual(activation["timeout_ms"], 30000)
+        self.assertTrue(activation["challenge"])
+
+        pending_response = await self.client.post(
+            "/xiaozhi/ota/activate",
+            data="{}",
+            headers={
+                "device-id": "68:ee:8f:5c:71:99",
+                "client-id": "client-activation-001",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(pending_response.status, 202)
+        self.assertFalse((await pending_response.json())["activated"])
+
+        bind_response = await self.client.post(
+            "/api/app/devices/bind",
+            data=json.dumps({"device_code": activation["code"]}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(bind_response.status, 200)
+
+        activated_response = await self.client.post(
+            "/xiaozhi/ota/activate",
+            data="{}",
+            headers={
+                "device-id": "68:ee:8f:5c:71:99",
+                "client-id": "client-activation-001",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(activated_response.status, 200)
+        self.assertTrue((await activated_response.json())["activated"])
+
+        next_ota_response = await self.client.post(
+            "/xiaozhi/ota/",
+            data=json.dumps(
+                {
+                    "board": {"type": "baize-s3-eye"},
+                    "application": {"version": "2.0.1"},
+                }
+            ),
+            headers={
+                "device-id": "68:ee:8f:5c:71:99",
+                "client-id": "client-activation-001",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(next_ota_response.status, 200)
+        self.assertNotIn("activation", await next_ota_response.json())
 
     @unittest_run_loop
     async def test_ota_report_updates_app_device_status(self):
