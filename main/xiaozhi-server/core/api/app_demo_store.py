@@ -6,8 +6,10 @@ import hmac
 import sqlite3
 import uuid
 import glob
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
 
 DEMO_TOKEN = "demo-token"
@@ -15,8 +17,17 @@ DEMO_USER_ID = "demo_user"
 DEMO_DEVICE_CODE = "123456"
 DEMO_DEVICE_ID = "baize_dev_001"
 DEFAULT_INVITE_CODE = "BAIZE-MVP"
-INITIAL_ENERGY = 30
-DAILY_ENERGY_LIMIT = 30
+INITIAL_SPIRIT_POWER = 120
+SPIRIT_POWER_LIMIT = 120
+SPIRIT_POWER_RECOVERY_PER_HOUR = 5
+SPIRIT_POWER_PER_MINUTE = 5
+SPIRIT_DEW_AMOUNT = 30
+SPIRIT_DEW_MAX_INVENTORY = 7
+PRODUCT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+PRODUCT_DAY_BOUNDARY_HOUR = 4
+# Legacy aliases keep the existing SQLite schema and old clients migratable.
+INITIAL_ENERGY = INITIAL_SPIRIT_POWER
+DAILY_ENERGY_LIMIT = SPIRIT_POWER_LIMIT
 PASSWORD_MIN_LENGTH = 6
 PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
 USER_ROLE = "user"
@@ -89,8 +100,18 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def product_day_key(value: datetime | None = None) -> str:
+    current = (value or datetime.now(timezone.utc)).astimezone(PRODUCT_TIMEZONE)
+    return (current - timedelta(hours=PRODUCT_DAY_BOUNDARY_HOUR)).date().isoformat()
+
+
 def today_key() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return product_day_key()
+
+
+def spirit_power_cost_for_seconds(valid_user_audio_seconds: float | int | None) -> int:
+    seconds = max(0.0, float(valid_user_audio_seconds or 0))
+    return max(SPIRIT_POWER_PER_MINUTE, math.ceil(seconds / 60) * SPIRIT_POWER_PER_MINUTE)
 
 
 def app_mvp_db_path_from_config(config: dict) -> str:
@@ -292,7 +313,8 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
             current_energy INTEGER NOT NULL,
             daily_limit INTEGER NOT NULL,
             updated_at TEXT NOT NULL,
-            last_recovered_on TEXT NOT NULL
+            last_recovered_on TEXT NOT NULL,
+            last_hourly_recovered_at TEXT
         );
         CREATE TABLE IF NOT EXISTS energy_events (
             id TEXT PRIMARY KEY,
@@ -301,6 +323,23 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
             delta INTEGER NOT NULL,
             reason TEXT NOT NULL,
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS spirit_power_items (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            item_type TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            granted_on TEXT NOT NULL,
+            expires_on TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS spirit_power_checkins (
+            user_id TEXT NOT NULL,
+            product_day TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, product_day)
         );
         CREATE TABLE IF NOT EXISTS intimacy_accounts (
             user_id TEXT NOT NULL,
@@ -362,6 +401,31 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     device_columns = _table_columns(conn, "devices")
     if "activity_status" not in device_columns:
         conn.execute("ALTER TABLE devices ADD COLUMN activity_status TEXT NOT NULL DEFAULT 'unknown'")
+    energy_columns = _table_columns(conn, "energy_accounts")
+    if "last_hourly_recovered_at" not in energy_columns:
+        conn.execute("ALTER TABLE energy_accounts ADD COLUMN last_hourly_recovered_at TEXT")
+    now = now_iso()
+    product_day = product_day_key()
+    legacy_accounts = conn.execute(
+        "SELECT user_id, current_energy FROM energy_accounts WHERE daily_limit != ?",
+        (SPIRIT_POWER_LIMIT,),
+    ).fetchall()
+    for account in legacy_accounts:
+        delta = SPIRIT_POWER_LIMIT - account["current_energy"]
+        conn.execute(
+            """
+            UPDATE energy_accounts
+            SET current_energy = ?, daily_limit = ?, updated_at = ?,
+                last_recovered_on = ?, last_hourly_recovered_at = ?
+            WHERE user_id = ?
+            """,
+            (SPIRIT_POWER_LIMIT, SPIRIT_POWER_LIMIT, now, product_day, now, account["user_id"]),
+        )
+        if delta:
+            conn.execute(
+                "INSERT INTO energy_events(id, user_id, delta, reason, created_at) VALUES (?, ?, ?, 'spirit_power_migration', ?)",
+                (f"energy_{uuid.uuid4().hex}", account["user_id"], delta, now),
+            )
 
 
 def normalize_phone(phone: str | None) -> str:
@@ -520,35 +584,97 @@ def _progress_for_score(score: int) -> Dict[str, Any]:
 
 def _ensure_energy(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM energy_accounts WHERE user_id = ?", (user_id,)).fetchone()
-    today = today_key()
+    today = product_day_key()
     now = now_iso()
     if row is None:
         conn.execute(
-            "INSERT INTO energy_accounts(user_id, current_energy, daily_limit, updated_at, last_recovered_on) VALUES (?, ?, ?, ?, ?)",
-            (user_id, INITIAL_ENERGY, DAILY_ENERGY_LIMIT, now, today),
+            """
+            INSERT INTO energy_accounts(
+                user_id, current_energy, daily_limit, updated_at,
+                last_recovered_on, last_hourly_recovered_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, INITIAL_SPIRIT_POWER, SPIRIT_POWER_LIMIT, now, today, now),
         )
         conn.commit()
     elif row["last_recovered_on"] != today:
+        delta = max(0, row["daily_limit"] - row["current_energy"])
         conn.execute(
-            "UPDATE energy_accounts SET current_energy = daily_limit, updated_at = ?, last_recovered_on = ? WHERE user_id = ?",
-            (now, today, user_id),
+            """
+            UPDATE energy_accounts
+            SET current_energy = daily_limit, updated_at = ?, last_recovered_on = ?,
+                last_hourly_recovered_at = ?
+            WHERE user_id = ?
+            """,
+            (now, today, now, user_id),
         )
-        conn.execute(
-            "INSERT INTO energy_events(id, user_id, delta, reason, created_at) VALUES (?, ?, ?, 'daily_recover', ?)",
-            (f"energy_{uuid.uuid4().hex}", user_id, row["daily_limit"], now),
-        )
+        if delta:
+            conn.execute(
+                "INSERT INTO energy_events(id, user_id, delta, reason, created_at) VALUES (?, ?, ?, 'daily_spirit_refill', ?)",
+                (f"energy_{uuid.uuid4().hex}", user_id, delta, now),
+            )
         conn.commit()
+    else:
+        last_hourly_raw = row["last_hourly_recovered_at"] or row["updated_at"] or now
+        try:
+            last_hourly = datetime.fromisoformat(last_hourly_raw.replace("Z", "+00:00"))
+            current_time = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            elapsed_hours = max(0, int((current_time - last_hourly).total_seconds() // 3600))
+        except (TypeError, ValueError):
+            elapsed_hours = 0
+            last_hourly = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        if elapsed_hours > 0:
+            recovered = min(
+                row["daily_limit"] - row["current_energy"],
+                elapsed_hours * SPIRIT_POWER_RECOVERY_PER_HOUR,
+            )
+            recovered_at = (last_hourly + timedelta(hours=elapsed_hours)).replace(microsecond=0).isoformat()
+            conn.execute(
+                """
+                UPDATE energy_accounts
+                SET current_energy = current_energy + ?, updated_at = ?, last_hourly_recovered_at = ?
+                WHERE user_id = ?
+                """,
+                (max(0, recovered), now, recovered_at, user_id),
+            )
+            if recovered > 0:
+                conn.execute(
+                    "INSERT INTO energy_events(id, user_id, delta, reason, created_at) VALUES (?, ?, ?, 'hourly_spirit_recovery', ?)",
+                    (f"energy_{uuid.uuid4().hex}", user_id, recovered, now),
+                )
+            conn.commit()
     return conn.execute("SELECT * FROM energy_accounts WHERE user_id = ?", (user_id,)).fetchone()
 
 
-def _energy_payload(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+def _spirit_power_payload(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
     row = _ensure_energy(conn, user_id)
+    today = product_day_key()
+    inventory_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM spirit_power_items
+        WHERE user_id = ? AND used_at IS NULL AND expires_on >= ?
+        """,
+        (user_id, today),
+    ).fetchone()["c"]
+    checked_in = conn.execute(
+        "SELECT 1 FROM spirit_power_checkins WHERE user_id = ? AND product_day = ?",
+        (user_id, today),
+    ).fetchone() is not None
     return {
         "current": row["current_energy"],
         "daily_limit": row["daily_limit"],
+        "max": row["daily_limit"],
+        "recovery_per_hour": SPIRIT_POWER_RECOVERY_PER_HOUR,
         "updated_at": row["updated_at"],
         "last_recovered_on": row["last_recovered_on"],
+        "checked_in_today": checked_in,
+        "spirit_dew_count": inventory_count,
+        "spirit_dew_amount": SPIRIT_DEW_AMOUNT,
     }
+
+
+def _energy_payload(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+    return _spirit_power_payload(conn, user_id)
 
 
 def consume_energy(config: dict, user_id: str, device_id: str | None, amount: int, reason: str) -> bool:
@@ -566,6 +692,138 @@ def consume_energy(config: dict, user_id: str, device_id: str | None, amount: in
         )
         conn.commit()
     return True
+
+
+def consume_spirit_power(config: dict, user_id: str, device_id: str | None, amount: int, reason: str) -> bool:
+    return consume_energy(config, user_id, device_id, amount, reason)
+
+
+def spirit_power_summary(config: dict, user_id: str) -> Dict[str, Any]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        return _spirit_power_payload(conn, user_id)
+
+
+def _spirit_power_item_payload(row: sqlite3.Row) -> Dict[str, Any]:
+    names = {"spirit_dew": "白泽灵露"}
+    return {
+        "id": row["id"],
+        "item_type": row["item_type"],
+        "name": names.get(row["item_type"], row["item_type"]),
+        "amount": row["amount"],
+        "expires_on": row["expires_on"],
+        "granted_on": row["granted_on"],
+    }
+
+
+def list_spirit_power_items(config: dict, user_id: str) -> list[Dict[str, Any]]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        today = product_day_key()
+        rows = conn.execute(
+            """
+            SELECT * FROM spirit_power_items
+            WHERE user_id = ? AND used_at IS NULL AND expires_on >= ?
+            ORDER BY expires_on, created_at
+            """,
+            (user_id, today),
+        ).fetchall()
+        return [_spirit_power_item_payload(row) for row in rows]
+
+
+def check_in_spirit_power(config: dict, user_id: str) -> Dict[str, Any]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        _ensure_energy(conn, user_id)
+        today = product_day_key()
+        existing = conn.execute(
+            "SELECT item_id FROM spirit_power_checkins WHERE user_id = ? AND product_day = ?",
+            (user_id, today),
+        ).fetchone()
+        if existing:
+            return {"already_checked_in": True, "spirit_power": _spirit_power_payload(conn, user_id)}
+        inventory_count = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM spirit_power_items
+            WHERE user_id = ? AND used_at IS NULL AND expires_on >= ?
+            """,
+            (user_id, today),
+        ).fetchone()["c"]
+        if inventory_count >= SPIRIT_DEW_MAX_INVENTORY:
+            raise ValueError("白泽灵露已存满，请先使用后再签到")
+        now = now_iso()
+        item_id = f"spirit_item_{uuid.uuid4().hex}"
+        expires_on = (
+            datetime.fromisoformat(today).date() + timedelta(days=7)
+        ).isoformat()
+        conn.execute(
+            """
+            INSERT INTO spirit_power_items(
+                id, user_id, item_type, amount, granted_on, expires_on, created_at
+            ) VALUES (?, ?, 'spirit_dew', ?, ?, ?, ?)
+            """,
+            (item_id, user_id, SPIRIT_DEW_AMOUNT, today, expires_on, now),
+        )
+        conn.execute(
+            "INSERT INTO spirit_power_checkins(user_id, product_day, item_id, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, today, item_id, now),
+        )
+        conn.execute(
+            "INSERT INTO energy_events(id, user_id, delta, reason, created_at) VALUES (?, ?, 0, 'checkin_spirit_dew_grant', ?)",
+            (f"energy_{uuid.uuid4().hex}", user_id, now),
+        )
+        conn.commit()
+        return {
+            "already_checked_in": False,
+            "item": _spirit_power_item_payload(
+                conn.execute("SELECT * FROM spirit_power_items WHERE id = ?", (item_id,)).fetchone()
+            ),
+            "spirit_power": _spirit_power_payload(conn, user_id),
+        }
+
+
+def use_spirit_dew(config: dict, user_id: str, item_id: str | None = None) -> Dict[str, Any]:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        account = _ensure_energy(conn, user_id)
+        if account["current_energy"] > account["daily_limit"] - SPIRIT_DEW_AMOUNT:
+            raise ValueError(f"当前灵力高于 {account['daily_limit'] - SPIRIT_DEW_AMOUNT} 点，暂时不需要使用白泽灵露")
+        today = product_day_key()
+        if item_id:
+            item = conn.execute(
+                """
+                SELECT * FROM spirit_power_items
+                WHERE id = ? AND user_id = ? AND used_at IS NULL AND expires_on >= ?
+                """,
+                (item_id, user_id, today),
+            ).fetchone()
+        else:
+            item = conn.execute(
+                """
+                SELECT * FROM spirit_power_items
+                WHERE user_id = ? AND used_at IS NULL AND expires_on >= ?
+                ORDER BY expires_on, created_at LIMIT 1
+                """,
+                (user_id, today),
+            ).fetchone()
+        if not item:
+            raise ValueError("没有可用的白泽灵露")
+        now = now_iso()
+        conn.execute("UPDATE spirit_power_items SET used_at = ? WHERE id = ?", (now, item["id"]))
+        conn.execute(
+            "UPDATE energy_accounts SET current_energy = current_energy + ?, updated_at = ? WHERE user_id = ?",
+            (item["amount"], now, user_id),
+        )
+        conn.execute(
+            "INSERT INTO energy_events(id, user_id, delta, reason, created_at) VALUES (?, ?, ?, 'spirit_dew_use', ?)",
+            (f"energy_{uuid.uuid4().hex}", user_id, item["amount"], now),
+        )
+        conn.commit()
+        return {"used_item_id": item["id"], "spirit_power": _spirit_power_payload(conn, user_id)}
 
 
 def _ensure_intimacy(conn: sqlite3.Connection, user_id: str, device_id: str) -> sqlite3.Row:
@@ -1787,9 +2045,11 @@ def user_summary(config: dict, user_id: str) -> Dict[str, Any]:
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if not user_row:
             return {}
+        spirit_power = _spirit_power_payload(conn, user_id)
         return {
             **_row_to_user(user_row),
-            "energy": _energy_payload(conn, user_id),
+            "spirit_power": spirit_power,
+            "energy": spirit_power,
             "intimacy": intimacy_payload(conn, user_id),
         }
 

@@ -941,7 +941,7 @@ class ConnectionHandler:
                 )
             )
             if not self._app_has_energy_for_voice_dialogue():
-                energy_reply = "白泽今天的陪伴精力不够了，明天恢复后再继续陪你聊。"
+                energy_reply = "白泽现在的灵力不足，恢复后再继续陪你聊。"
                 self.tts.tts_text_queue.put(
                     TTSMessageDTO(
                         sentence_id=current_sentence_id,
@@ -1343,8 +1343,8 @@ class ConnectionHandler:
             app_device = self._resolve_app_device()
             if not app_device:
                 return
-            if not consume_energy(self.common_config, app_device["user_id"], app_device["id"], 1, "voice_dialogue"):
-                self.logger.bind(tag=TAG).warning("App user energy is not enough; skip dialogue persistence")
+            if not consume_energy(self.common_config, app_device["user_id"], app_device["id"], 5, "voice_dialogue"):
+                self.logger.bind(tag=TAG).warning("App user spirit power is not enough; skip dialogue persistence")
                 return
             append_dialogue(
                 self.common_config,
@@ -1376,7 +1376,7 @@ class ConnectionHandler:
         if not app_device:
             return True
         try:
-            return user_summary(self.common_config, app_device["user_id"])["energy"]["current"] >= 1
+            return user_summary(self.common_config, app_device["user_id"])["spirit_power"]["current"] >= 5
         except Exception:
             return True
 

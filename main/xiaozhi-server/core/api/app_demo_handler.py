@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from core.api.app_demo_store import (
+    DEMO_USER_ID,
     DEMO_TOKEN,
     append_dialogue,
     admin_metrics,
@@ -15,6 +16,7 @@ from core.api.app_demo_store import (
     bound_device,
     clean_baize_text,
     consume_energy,
+    check_in_spirit_power,
     create_device,
     delete_memory,
     generate_diary,
@@ -27,14 +29,13 @@ from core.api.app_demo_store import (
     list_energy_events,
     list_intimacy_events,
     list_memories,
-    load_state,
+    list_spirit_power_items,
     login_phone_user,
     ota_payload,
     register_phone_user,
     register_or_login_user,
     resolve_bound_app_device,
     rotate_device_code,
-    state_path_from_config,
     unbind_device,
     update_device_name,
     update_user_password,
@@ -42,6 +43,8 @@ from core.api.app_demo_store import (
     update_settings,
     user_for_token,
     user_summary,
+    spirit_power_summary,
+    use_spirit_dew,
 )
 from core.api.base_handler import BaseHandler
 from core.providers.tools.device_mcp.mcp_handler import _refresh_device_status_report
@@ -63,7 +66,6 @@ class AppDemoHandler(BaseHandler):
         demo_runner=None,
     ):
         super().__init__(config)
-        self.state_path = state_path_from_config(config)
         self.llm_factory = llm_factory or llm_utils.create_instance
         self._demo_llm = None
         self.device_registry = device_registry
@@ -79,10 +81,15 @@ class AppDemoHandler(BaseHandler):
             web.post("/api/app/login", self.handle_login),
             web.post("/api/app/demo-login", self.handle_demo_login),
             web.get("/api/app/me", self.handle_me),
+            web.get("/api/app/spirit-power", self.handle_spirit_power),
+            web.get("/api/app/spirit-power/items", self.handle_spirit_power_items),
+            web.post("/api/app/spirit-power/check-in", self.handle_spirit_power_check_in),
+            web.post("/api/app/spirit-power/items/use", self.handle_spirit_dew_use),
             web.post("/api/app/me/password", self.handle_update_password),
             web.get("/api/app/admin/metrics", self.handle_admin_metrics),
             web.get("/api/app/admin/conversations", self.handle_admin_conversations),
             web.get("/api/app/admin/energy-events", self.handle_admin_energy_events),
+            web.get("/api/app/admin/spirit-power-events", self.handle_admin_energy_events),
             web.get("/api/app/admin/intimacy-events", self.handle_admin_intimacy_events),
             web.get("/api/app/admin/devices", self.handle_admin_devices),
             web.post("/api/app/admin/devices", self.handle_admin_create_device),
@@ -162,12 +169,11 @@ class AppDemoHandler(BaseHandler):
         return self._json_response(result)
 
     async def handle_demo_login(self, request):
-        state = load_state(self.state_path)
         return self._json_response(
             {
                 "token": DEMO_TOKEN,
                 "legacy": True,
-                "user": state["users"]["demo_user"],
+                "user": user_summary(self.config, DEMO_USER_ID),
             }
         )
 
@@ -176,6 +182,37 @@ class AppDemoHandler(BaseHandler):
         if not user:
             return self._error_response("未登录或 token 无效", status=401)
         return self._json_response(user_summary(self.config, user["id"]))
+
+    async def handle_spirit_power(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        return self._json_response(spirit_power_summary(self.config, user["id"]))
+
+    async def handle_spirit_power_check_in(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        try:
+            return self._json_response(check_in_spirit_power(self.config, user["id"]))
+        except ValueError as e:
+            return self._error_response(str(e), status=409)
+
+    async def handle_spirit_power_items(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        return self._json_response({"items": list_spirit_power_items(self.config, user["id"])})
+
+    async def handle_spirit_dew_use(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        try:
+            payload = await self._read_json(request)
+            return self._json_response(use_spirit_dew(self.config, user["id"], str(payload.get("item_id", "")).strip() or None))
+        except ValueError as e:
+            return self._error_response(str(e), status=409)
 
     async def handle_update_password(self, request):
         user = self._current_user(request)
@@ -387,8 +424,8 @@ class AppDemoHandler(BaseHandler):
         if isinstance(device_or_response, web.Response):
             return device_or_response
         device = device_or_response
-        if user_summary(self.config, user["id"])["energy"]["current"] < 1:
-            return self._error_response("白泽今天的陪伴精力不足，明天会恢复一些。", status=409)
+        if user_summary(self.config, user["id"])["spirit_power"]["current"] < 5:
+            return self._error_response("白泽的灵力不足，稍后恢复一些再来陪你。", status=409)
 
         payload = await self._read_json(request)
         user_text = str(payload.get("text", "")).strip()
@@ -407,8 +444,8 @@ class AppDemoHandler(BaseHandler):
             return self._error_response("Debug Chat 调用失败", status=500)
 
         session_id = f"demo_chat_{uuid.uuid4().hex}"
-        if not consume_energy(self.config, user["id"], device["id"], 1, "debug_chat"):
-            return self._error_response("白泽今天的陪伴精力不足，明天会恢复一些。", status=409)
+        if not consume_energy(self.config, user["id"], device["id"], 5, "debug_chat"):
+            return self._error_response("白泽的灵力不足，稍后恢复一些再来陪你。", status=409)
         dialogue = append_dialogue(
             self.config,
             source_device_id=device.get("source_device_id") or "",
@@ -437,14 +474,11 @@ class AppDemoHandler(BaseHandler):
         user, device_or_response = self._get_bound_device_or_response(request)
         if isinstance(device_or_response, web.Response):
             return device_or_response
-        if user_summary(self.config, user["id"])["energy"]["current"] < 2:
-            return self._error_response("白泽今天的陪伴精力不足，明天会恢复一些。", status=409)
         payload = await self._read_json(request)
         diary_date = str(payload.get("date", "")).strip() or None
         diary = generate_diary(self.config, diary_date=diary_date, user_id=user["id"], device_id=device_or_response["id"])
         if not diary:
             return self._error_response("没有可生成日记的对话记录", status=404)
-        consume_energy(self.config, user["id"], device_or_response["id"], 2, "generate_diary")
         return self._json_response(diary)
 
     async def handle_ota(self, request):

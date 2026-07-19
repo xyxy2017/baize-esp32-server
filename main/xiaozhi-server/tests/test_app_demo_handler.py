@@ -1,8 +1,10 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
@@ -36,6 +38,50 @@ sys.modules.setdefault("opuslib_next", types.ModuleType("opuslib_next"))
 from core.api.app_demo_handler import AppDemoHandler, DEMO_TOKEN
 from core.api.health_handler import HealthHandler
 from core.api.ota_handler import OTAHandler
+
+
+class SpiritPowerRuleTest(unittest.TestCase):
+    def test_product_day_switches_at_four_am_in_shanghai(self):
+        from core.api.app_demo_store import product_day_key
+
+        self.assertEqual(product_day_key(datetime(2026, 7, 18, 19, 59, tzinfo=timezone.utc)), "2026-07-18")
+        self.assertEqual(product_day_key(datetime(2026, 7, 18, 20, 0, tzinfo=timezone.utc)), "2026-07-19")
+
+    def test_voice_cost_uses_five_spirit_power_per_started_minute(self):
+        from core.api.app_demo_store import spirit_power_cost_for_seconds
+
+        self.assertEqual(spirit_power_cost_for_seconds(1), 5)
+        self.assertEqual(spirit_power_cost_for_seconds(60), 5)
+        self.assertEqual(spirit_power_cost_for_seconds(61), 10)
+
+    def test_hourly_recovery_and_daily_refill(self):
+        from core.api.app_demo_store import product_day_key, user_summary
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "spirit.sqlite3")
+            config = {"app_mvp": {"db_path": db_path}}
+            user_summary(config, "demo_user")
+            two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2, minutes=1)).replace(microsecond=0).isoformat()
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "UPDATE energy_accounts SET current_energy = 100, last_recovered_on = ?, last_hourly_recovered_at = ? WHERE user_id = 'demo_user'",
+                    (product_day_key(), two_hours_ago),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(user_summary(config, "demo_user")["spirit_power"]["current"], 110)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "UPDATE energy_accounts SET current_energy = 10, last_recovered_on = '2000-01-01' WHERE user_id = 'demo_user'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(user_summary(config, "demo_user")["spirit_power"]["current"], 120)
 
 
 class AppDemoHandlerTest(AioHTTPTestCase):
@@ -298,7 +344,9 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(me_response.status, 200)
         me_payload = await me_response.json()
         self.assertEqual(me_payload["nickname"], "Alice")
-        self.assertEqual(me_payload["energy"]["current"], 30)
+        self.assertEqual(me_payload["spirit_power"]["current"], 120)
+        self.assertEqual(me_payload["spirit_power"]["recovery_per_hour"], 5)
+        self.assertEqual(me_payload["energy"]["current"], 120)
         self.assertEqual(me_payload["intimacy"]["level"], "初识")
 
         empty_devices = await self.client.get("/api/app/devices", headers=alice_headers)
@@ -376,6 +424,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         login_payload = await login_response.json()
         me_payload = await (await self.client.get("/api/app/me", headers={"Authorization": f"Bearer {login_payload['token']}"})).json()
         self.assertIn("energy", me_payload)
+        self.assertIn("spirit_power", me_payload)
         self.assertEqual(me_payload["role"], "user")
 
         update_response = await self.client.post(
@@ -823,6 +872,37 @@ class AppDemoHandlerTest(AioHTTPTestCase):
                 self.assertEqual(clean_baize_text(raw), expected)
 
     @unittest_run_loop
+    async def test_spirit_power_check_in_and_spirit_dew_use(self):
+        from core.api.app_demo_store import DEMO_USER_ID, consume_energy
+
+        first = await self.client.post("/api/app/spirit-power/check-in", headers=self.auth_headers())
+        self.assertEqual(first.status, 200)
+        first_payload = await first.json()
+        self.assertFalse(first_payload["already_checked_in"])
+        self.assertEqual(first_payload["item"]["amount"], 30)
+        self.assertEqual(first_payload["spirit_power"]["spirit_dew_count"], 1)
+        items_response = await self.client.get("/api/app/spirit-power/items", headers=self.auth_headers())
+        self.assertEqual(items_response.status, 200)
+        items = (await items_response.json())["items"]
+        self.assertEqual(items[0]["id"], first_payload["item"]["id"])
+        self.assertEqual(items[0]["item_type"], "spirit_dew")
+
+        second = await self.client.post("/api/app/spirit-power/check-in", headers=self.auth_headers())
+        self.assertEqual(second.status, 200)
+        self.assertTrue((await second.json())["already_checked_in"])
+
+        self.assertTrue(consume_energy(self.config, DEMO_USER_ID, None, 30, "test_spirit_dew"))
+        used = await self.client.post(
+            "/api/app/spirit-power/items/use",
+            data=json.dumps({"item_id": first_payload["item"]["id"]}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(used.status, 200)
+        used_payload = await used.json()
+        self.assertEqual(used_payload["spirit_power"]["current"], 120)
+        self.assertEqual(used_payload["spirit_power"]["spirit_dew_count"], 0)
+
+    @unittest_run_loop
     async def test_generate_diary_from_dialogues_and_list_it(self):
         from core.api.app_demo_store import append_dialogue
 
@@ -848,6 +928,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             emotion="happy",
         )
 
+        spirit_before = await (await self.client.get("/api/app/spirit-power", headers=self.auth_headers())).json()
         generate_response = await self.client.post(
             "/api/app/devices/baize_dev_001/diaries/generate",
             headers=self.auth_headers(),
@@ -871,6 +952,8 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertNotIn("白泽回应", diary["summary"])
         self.assertIn("今天我记得", diary["baize_note"])
         self.assertEqual(len(diary["quotes"]), 2)
+        spirit_after = await (await self.client.get("/api/app/spirit-power", headers=self.auth_headers())).json()
+        self.assertEqual(spirit_after["current"], spirit_before["current"])
 
         list_response = await self.client.get(
             "/api/app/devices/baize_dev_001/diaries", headers=self.auth_headers()
