@@ -11,8 +11,8 @@ ExecStart=/opt/miniconda/envs/baize/bin/python app.py
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-StandardOutput=append:/opt/baize-server/xiaozhi-server/tmp/baize-server.log
-StandardError=append:/opt/baize-server/xiaozhi-server/tmp/baize-server.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

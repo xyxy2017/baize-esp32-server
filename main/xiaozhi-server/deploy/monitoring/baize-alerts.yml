@@ -1,0 +1,28 @@
+groups:
+  - name: baize
+    rules:
+      - alert: BaizeAppDown
+        expr: up{job="baize-app"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Baize metrics endpoint is unavailable"}
+      - alert: BaizeHealthEndpointFailed
+        expr: probe_success{job="blackbox-https"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Public Baize HTTPS health check failed"}
+      - alert: BaizeDiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 0.15
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Root filesystem has less than 15% free space"}
+      - alert: BaizeCertificateExpiring
+        expr: probe_ssl_earliest_cert_expiry{job="blackbox-https"} - time() < 30 * 24 * 3600
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Baize HTTPS certificate expires within 30 days"}
+      - alert: BaizeHttp5xxRateHigh
+        expr: sum(rate(baize_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(baize_http_requests_total[5m])), 0.1) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Baize HTTP 5xx rate exceeds 5%"}

@@ -1330,11 +1330,7 @@ class ConnectionHandler:
                 )
             )
             # 使用lambda延迟计算，只有在DEBUG级别时才执行get_llm_dialogue()
-            self.logger.bind(tag=TAG).debug(
-                lambda: json.dumps(
-                    self.dialogue.get_llm_dialogue(), indent=4, ensure_ascii=False
-                )
-            )
+            self.logger.bind(tag=TAG).debug("LLM dialogue turn completed")
 
         return True
 
@@ -1355,6 +1351,7 @@ class ConnectionHandler:
                 emotion=getattr(self, "latest_emotion", "neutral") or "neutral",
                 user_id=app_device["user_id"],
                 device_id=app_device["id"],
+                source="voice",
             )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"写入 App 对话记录失败: {e}")

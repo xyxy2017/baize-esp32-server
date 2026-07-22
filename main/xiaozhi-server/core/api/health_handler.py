@@ -9,6 +9,7 @@ from aiohttp import web
 
 from core.api.app_demo_store import app_mvp_db_path_from_config, ensure_db
 from core.api.base_handler import BaseHandler
+from core.telemetry import set_sqlite_health
 
 
 class HealthHandler(BaseHandler):
@@ -27,6 +28,7 @@ class HealthHandler(BaseHandler):
 
     async def handle_healthz(self, request):
         db = self._sqlite_health()
+        set_sqlite_health(db["ok"])
         payload: Dict[str, Any] = {
             "status": "ok" if db["ok"] else "degraded",
             "service": "baize-xiaozhi-server",

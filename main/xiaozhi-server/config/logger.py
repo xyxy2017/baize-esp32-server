@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from loguru import logger
 from config.config_loader import load_config
@@ -7,6 +8,13 @@ from datetime import datetime
 
 SERVER_VERSION = "0.9.4"
 _logger_initialized = False
+_SENSITIVE_LOG_VALUE = re.compile(
+    r"(?i)(authorization|token|password|secret|sms_code)(['\"]?\s*[:=]\s*['\"]?)([^,'\"}]+)"
+)
+
+
+def _redact_sensitive_log_values(message):
+    return _SENSITIVE_LOG_VALUE.sub(r"\1\2<redacted>", str(message))
 
 
 def get_module_abbreviation(module_name, module_dict):
@@ -42,6 +50,7 @@ def formatter(record):
     record["extra"].setdefault("selected_module", "00000000000000")
     # 将 selected_module 从 extra 提取到顶级，以支持 {selected_module} 格式
     record["selected_module"] = record["extra"]["selected_module"]
+    record["message"] = _redact_sensitive_log_values(record["message"])
     return record["message"]
 
 
@@ -75,6 +84,7 @@ def setup_logging():
         log_level = log_config.get("log_level", "INFO")
         log_dir = log_config.get("log_dir", "tmp")
         log_file = log_config.get("log_file", "server.log")
+        json_log_file = log_config.get("json_log_file", "server.jsonl")
         metrics_log_file = log_config.get("metrics_log_file", "conversation_metrics.log")
         data_dir = log_config.get("data_dir", "data")
 
@@ -104,6 +114,20 @@ def setup_logging():
             enqueue=True,  # 异步安全
             backtrace=True,
             diagnose=True,
+        )
+
+        logger.add(
+            os.path.join(log_dir, json_log_file),
+            level=log_level,
+            filter=formatter,
+            rotation="10 MB",
+            retention="30 days",
+            compression=None,
+            encoding="utf-8",
+            enqueue=True,
+            serialize=True,
+            backtrace=True,
+            diagnose=False,
         )
 
         metrics_log_file_path = os.path.join(log_dir, metrics_log_file)

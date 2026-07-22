@@ -34,6 +34,7 @@ from core.connection import ConnectionHandler
 from config.config_loader import get_config_from_api_async
 from core.auth import AuthManager, AuthenticationError
 from core.utils.modules_initialize import initialize_modules
+from core.telemetry import websocket_closed, websocket_opened
 from core.utils.util import check_vad_update, check_asr_update
 
 TAG = __name__
@@ -124,11 +125,15 @@ class WebSocketServer:
             self._intent,
             self,  # 传入server实例
         )
+        result = "success"
+        websocket_opened()
         try:
             await handler.handle_connection(websocket)
         except Exception as e:
+            result = "error"
             self.logger.bind(tag=TAG).error(f"处理连接时出错: {e}")
         finally:
+            websocket_closed(result)
             # 强制关闭连接（如果还没有关闭的话）
             try:
                 # 安全地检查WebSocket状态并关闭

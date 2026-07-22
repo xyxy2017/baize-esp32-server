@@ -455,6 +455,7 @@ class AppDemoHandler(BaseHandler):
             emotion="neutral",
             user_id=user["id"],
             device_id=device["id"],
+            source="debug",
         )
         return self._json_response({"reply": reply, "session_id": session_id, "dialogue": dialogue})
 

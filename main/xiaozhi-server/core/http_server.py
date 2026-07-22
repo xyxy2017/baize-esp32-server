@@ -1,10 +1,14 @@
 import asyncio
+import time
+import uuid
 from aiohttp import web
 from config.logger import setup_logging
+from core.api.app_demo_store import admin_metrics
 from core.api.app_demo_handler import AppDemoHandler
 from core.api.health_handler import HealthHandler
 from core.api.ota_handler import OTAHandler
 from core.api.vision_handler import VisionHandler
+from core.telemetry import metrics_payload, observe_http_request, set_business_snapshot
 
 TAG = __name__
 
@@ -44,9 +48,40 @@ class SimpleHttpServer:
             port = int(server_config.get("http_port", 8003))
 
             if port:
-                app = web.Application()
+                @web.middleware
+                async def telemetry_middleware(request, handler):
+                    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+                    started = time.monotonic()
+                    status = 500
+                    try:
+                        response = await handler(request)
+                        status = response.status
+                        response.headers["X-Request-ID"] = request_id
+                        return response
+                    except web.HTTPException as exc:
+                        status = exc.status
+                        raise
+                    finally:
+                        route = request.path
+                        if request.match_info.route is not None:
+                            resource = request.match_info.route.resource
+                            if resource is not None:
+                                route = resource.canonical
+                        duration = time.monotonic() - started
+                        observe_http_request(request.method, route, status, duration)
+                        self.logger.bind(
+                            tag=TAG,
+                            request_id=request_id,
+                            method=request.method,
+                            route=route,
+                            status=status,
+                            duration_ms=round(duration * 1000, 2),
+                        ).info("http_request")
+
+                app = web.Application(middlewares=[telemetry_middleware])
                 app.add_routes(self.app_demo_handler.routes())
                 app.add_routes(self.health_handler.routes())
+                app.add_routes([web.get("/metrics", self.handle_metrics)])
 
                 if not read_config_from_api:
                     # 如果没有开启智控台，只是单模块运行，就需要再添加简单OTA接口，用于下发websocket接口
@@ -100,3 +135,16 @@ class SimpleHttpServer:
 
             self.logger.bind(tag=TAG).error(f"错误堆栈: {traceback.format_exc()}")
             raise
+
+    async def handle_metrics(self, request):
+        remote = request.remote or ""
+        if remote not in {"127.0.0.1", "::1"}:
+            raise web.HTTPForbidden(text="metrics endpoint is local only")
+        try:
+            set_business_snapshot(admin_metrics(self.config))
+        except Exception as exc:
+            self.logger.bind(tag=TAG).warning(
+                f"Unable to refresh metrics snapshot: {type(exc).__name__}"
+            )
+        body, content_type = metrics_payload()
+        return web.Response(body=body, headers={"Content-Type": content_type})

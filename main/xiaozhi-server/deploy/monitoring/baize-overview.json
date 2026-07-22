@@ -1,0 +1,24 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"type":"stat","title":"Public health","gridPos":{"h":5,"w":4,"x":0,"y":0},"targets":[{"expr":"probe_success{job='blackbox-https'}","refId":"A"}],"fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}}}]}}},
+    {"type":"stat","title":"Baize service","gridPos":{"h":5,"w":4,"x":4,"y":0},"targets":[{"expr":"up{job='baize-app'}","refId":"A"}],"fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}}}]}}},
+    {"type":"stat","title":"CPU usage","gridPos":{"h":5,"w":4,"x":8,"y":0},"targets":[{"expr":"100 - (avg by(instance) (rate(node_cpu_seconds_total{mode='idle'}[5m])) * 100)","refId":"A"}],"fieldConfig":{"defaults":{"unit":"percent"}}},
+    {"type":"stat","title":"Memory available","gridPos":{"h":5,"w":4,"x":12,"y":0},"targets":[{"expr":"node_memory_MemAvailable_bytes","refId":"A"}],"fieldConfig":{"defaults":{"unit":"bytes"}}},
+    {"type":"stat","title":"Disk free","gridPos":{"h":5,"w":4,"x":16,"y":0},"targets":[{"expr":"node_filesystem_avail_bytes{mountpoint='/',fstype!~'tmpfs|overlay'}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"bytes"}}},
+    {"type":"stat","title":"TLS days remaining","gridPos":{"h":5,"w":4,"x":20,"y":0},"targets":[{"expr":"(probe_ssl_earliest_cert_expiry{job='blackbox-https'} - time()) / 86400","refId":"A"}],"fieldConfig":{"defaults":{"unit":"d"}}},
+    {"type":"timeseries","title":"HTTP requests and 5xx","gridPos":{"h":8,"w":12,"x":0,"y":5},"targets":[{"expr":"sum(rate(baize_http_requests_total[5m]))","legendFormat":"requests/s","refId":"A"},{"expr":"sum(rate(baize_http_requests_total{status=~'5..'}[5m]))","legendFormat":"5xx/s","refId":"B"}]},
+    {"type":"timeseries","title":"HTTP P95 latency","gridPos":{"h":8,"w":12,"x":12,"y":5},"targets":[{"expr":"histogram_quantile(0.95, sum by (le) (rate(baize_http_request_duration_seconds_bucket[5m])))","legendFormat":"p95","refId":"A"}],"fieldConfig":{"defaults":{"unit":"s"}}},
+    {"type":"timeseries","title":"WebSocket connections","gridPos":{"h":8,"w":8,"x":0,"y":13},"targets":[{"expr":"baize_websocket_connections_active","legendFormat":"active","refId":"A"},{"expr":"sum(rate(baize_websocket_connections_total[5m]))","legendFormat":"completed/s","refId":"B"}]},
+    {"type":"timeseries","title":"Business activity","gridPos":{"h":8,"w":8,"x":8,"y":13},"targets":[{"expr":"sum(rate(baize_dialogues_total[5m]))","legendFormat":"dialogues/s","refId":"A"},{"expr":"sum(rate(baize_diaries_generated_total[5m]))","legendFormat":"diaries/s","refId":"B"},{"expr":"sum(rate(baize_energy_spent_total[5m]))","legendFormat":"energy/s","refId":"C"}]},
+    {"type":"timeseries","title":"Users and stored content","gridPos":{"h":8,"w":8,"x":16,"y":13},"targets":[{"expr":"baize_users","legendFormat":"users","refId":"A"},{"expr":"baize_bound_devices","legendFormat":"bindings","refId":"B"},{"expr":"baize_stored_dialogues","legendFormat":"dialogues","refId":"C"},{"expr":"baize_stored_diaries","legendFormat":"diaries","refId":"D"}]}
+  ],
+  "schemaVersion": 39,
+  "tags": ["baize"],
+  "templating": {"list": []},
+  "time": {"from":"now-6h","to":"now"},
+  "title": "Baize Service Overview",
+  "uid": "baize-overview",
+  "version": 1
+}

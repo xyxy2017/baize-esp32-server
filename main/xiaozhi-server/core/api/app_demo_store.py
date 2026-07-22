@@ -691,6 +691,9 @@ def consume_energy(config: dict, user_id: str, device_id: str | None, amount: in
             (f"energy_{uuid.uuid4().hex}", user_id, device_id, -amount, reason, now),
         )
         conn.commit()
+    from core.telemetry import energy_spent
+
+    energy_spent(amount, reason)
     return True
 
 
@@ -1452,6 +1455,7 @@ def append_dialogue(
     emotion: str = "neutral",
     user_id: str | None = None,
     device_id: str | None = None,
+    source: str = "voice",
 ) -> Dict[str, Any]:
     user_text = (user_text or "").strip()
     inferred_emotion = infer_emotion(baize_text, emotion or "neutral")
@@ -1494,6 +1498,9 @@ def append_dialogue(
         conn.commit()
     record_dialogue_intimacy(config, user_id, device_id)
     extract_memories_from_dialogue(config, user_id, device_id, user_text, baize_text)
+    from core.telemetry import dialogue_persisted
+
+    dialogue_persisted(source, inferred_emotion)
     return item
 
 
@@ -1890,6 +1897,9 @@ def generate_diary(
         )
         conn.commit()
     add_intimacy(config, user_id, device_id, 3, "generate_diary")
+    from core.telemetry import diary_generated
+
+    diary_generated()
     return {
         "id": diary_id,
         "date": diary_date,

@@ -1,0 +1,9 @@
+modules:
+  http_2xx_tls:
+    prober: http
+    timeout: 10s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      fail_if_ssl: false
+      preferred_ip_protocol: ip4
