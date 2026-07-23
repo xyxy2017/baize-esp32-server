@@ -2160,7 +2160,12 @@ def device_activation_state(
     source_device_id: str = "",
     client_id: str = "",
 ) -> Dict[str, Any] | None:
-    """Return whether a physical OTA device is bound to an App user."""
+    """Return the OTA activation state for a physical device.
+
+    The public firmware identifies itself with Device-Id and Client-Id headers.
+    A device is activated once any App user owns it through
+    user_device_bindings.
+    """
     source_device_id = (source_device_id or "").strip()
     client_id = (client_id or "").strip()
     if not source_device_id and not client_id:

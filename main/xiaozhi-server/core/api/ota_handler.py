@@ -61,8 +61,16 @@ class OTAHandler(BaseHandler):
 
         # firmware storage
         self.bin_dir = os.path.join(os.getcwd(), "data", "bin")
+        # Eye-animation resource storage. A package name is
+        # {board_type}_{version}.pack, for example zhengchen_eye_1.0.0.pack.
+        self.asset_dir = os.path.join(os.getcwd(), "data", "assets")
         # cache structure: { 'updated_at': timestamp, 'ttl': seconds, 'files_by_model': { model: [(version, filename), ...] } }
         self._bin_cache: Dict = {
+            "updated_at": 0,
+            "ttl": config.get("firmware_cache_ttl", 30),
+            "files_by_model": {},
+        }
+        self._asset_cache: Dict = {
             "updated_at": 0,
             "ttl": config.get("firmware_cache_ttl", 30),
             "files_by_model": {},
@@ -106,6 +114,30 @@ class OTAHandler(BaseHandler):
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"刷新固件缓存失败: {e}")
             # keep previous cache if any
+
+    def _refresh_asset_cache_if_needed(self):
+        now = int(time.time())
+        ttl = int(self._asset_cache.get("ttl", 30))
+        if now - int(self._asset_cache.get("updated_at", 0)) < ttl and self._asset_cache.get("files_by_model"):
+            return
+
+        files_by_model: Dict[str, List[Tuple[str, str]]] = {}
+        try:
+            os.makedirs(self.asset_dir, exist_ok=True)
+            for path in glob.glob(os.path.join(self.asset_dir, "*.pack")):
+                fname = os.path.basename(path)
+                m = re.match(r"^(.+?)_([0-9][A-Za-z0-9.\-_]*)\.pack$", fname)
+                if not m:
+                    continue
+                files_by_model.setdefault(m.group(1), []).append((m.group(2), fname))
+
+            for model, items in files_by_model.items():
+                items.sort(key=lambda it: _parse_version(it[0]), reverse=True)
+            self._asset_cache["files_by_model"] = files_by_model
+            self._asset_cache["updated_at"] = now
+            self.logger.bind(tag=TAG).info(f"Eye asset cache refreshed: {len(files_by_model)} models")
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"刷新眼睛资源缓存失败: {e}")
 
     def generate_password_signature(self, content: str, secret_key: str) -> str:
         """生成MQTT密码签名
@@ -152,6 +184,22 @@ class OTAHandler(BaseHandler):
                 "/mcp/vision/explain", f"/xiaozhi/ota/download/{filename}"
             )
         return f"http://{local_ip}:{http_port}/xiaozhi/ota/download/{filename}"
+
+    def _get_asset_download_url(self, filename: str, local_ip: str, http_port: int) -> str:
+        vision_url = get_vision_url(self.config)
+        if vision_url:
+            return vision_url.replace(
+                "/mcp/vision/explain", f"/xiaozhi/ota/assets/{filename}"
+            )
+        return f"http://{local_ip}:{http_port}/xiaozhi/ota/assets/{filename}"
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as file:
+            for chunk in iter(lambda: file.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _device_activation_enabled(self) -> bool:
         app_mvp = self.config.get("app_mvp", {}) or {}
@@ -258,6 +306,7 @@ class OTAHandler(BaseHandler):
                 "firmware": {
                     "version": device_version,
                     "url": "",
+                    "sha256": "",
                 },
             }
 
@@ -359,6 +408,7 @@ class OTAHandler(BaseHandler):
 
                 chosen_url = ""
                 chosen_version = device_version
+                chosen_sha256 = ""
 
                 # candidates are sorted descending by version
                 for ver, fname in candidates:
@@ -368,11 +418,15 @@ class OTAHandler(BaseHandler):
                         chosen_url = self._get_ota_download_url(
                             fname, local_ip, http_port
                         )
+                        chosen_sha256 = self._file_sha256(
+                            os.path.join(self.bin_dir, fname)
+                        )
                         break
 
                 if chosen_url:
                     return_json["firmware"]["version"] = chosen_version
                     return_json["firmware"]["url"] = chosen_url
+                    return_json["firmware"]["sha256"] = chosen_sha256
                     update_ota_report(
                         self.config,
                         current_version=device_version,
@@ -397,6 +451,31 @@ class OTAHandler(BaseHandler):
 
             except Exception as e:
                 self.logger.bind(tag=TAG).error(f"检查固件版本时出错: {e}")
+
+            # Eye animations are versioned independently from firmware. The device
+            # atomically switches to a newly downloaded package only after SHA-256
+            # verification, so an interrupted download keeps the previous package.
+            try:
+                device_assets_version = request.headers.get("eye-assets-version", "0.0.0").strip() or "0.0.0"
+                self._refresh_asset_cache_if_needed()
+                candidates = self._asset_cache.get("files_by_model", {}).get(device_model, [])
+                for version, filename in candidates:
+                    if not _is_higher_version(version, device_assets_version):
+                        continue
+                    path = os.path.join(self.asset_dir, filename)
+                    return_json["assets"] = {
+                        "version": version,
+                        "url": self._get_asset_download_url(filename, local_ip, http_port),
+                        "sha256": self._file_sha256(path),
+                        "size": os.path.getsize(path),
+                        "display": "240x240-gif1",
+                    }
+                    self.logger.bind(tag=TAG).info(
+                        f"为设备 {device_id} 下发眼睛资源 {version}: {filename}"
+                    )
+                    break
+            except Exception as e:
+                self.logger.bind(tag=TAG).error(f"检查眼睛资源版本时出错: {e}")
 
             response = web.Response(
                 text=json.dumps(return_json, separators=(",", ":")),
@@ -517,3 +596,24 @@ class OTAHandler(BaseHandler):
             except Exception:
                 pass
             return resp
+
+    async def handle_asset_download(self, request):
+        """Download a checked eye-animation package from data/assets."""
+        try:
+            fname = _safe_basename(request.match_info.get("filename", ""))
+            if not re.match(r"^[A-Za-z0-9.\-_]+\.pack$", fname):
+                raise web.HTTPBadRequest(text="invalid filename")
+            file_real = os.path.realpath(os.path.join(self.asset_dir, fname))
+            asset_dir_real = os.path.realpath(self.asset_dir)
+            if not file_real.startswith(asset_dir_real + os.sep):
+                raise web.HTTPForbidden(text="forbidden")
+            if not os.path.isfile(file_real):
+                raise web.HTTPNotFound(text="file not found")
+            resp = web.FileResponse(path=file_real)
+        except web.HTTPError as e:
+            resp = e
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"眼睛资源下载异常: {e}")
+            resp = web.Response(text="asset download error", status=500)
+        self._add_cors_headers(resp)
+        return resp
