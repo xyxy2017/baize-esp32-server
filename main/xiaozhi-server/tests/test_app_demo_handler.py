@@ -104,6 +104,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         )
         self.state_path = state_path
         self.bin_dir = str(Path(temp_dir.name) / "bin")
+        self.asset_dir = str(Path(temp_dir.name) / "assets")
         self.llm_instances = []
 
         class _FakeLLMProvider:
@@ -214,6 +215,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         health_handler = HealthHandler(self.config)
         ota_handler = OTAHandler(self.config)
         ota_handler.bin_dir = self.bin_dir
+        ota_handler.asset_dir = self.asset_dir
         app = web.Application()
         app.add_routes(handler.routes())
         app.add_routes(health_handler.routes())
@@ -221,6 +223,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             [
                 web.post("/xiaozhi/ota/", ota_handler.handle_post),
                 web.post("/xiaozhi/ota/activate", ota_handler.handle_activate),
+                web.get("/xiaozhi/ota/assets/{filename}", ota_handler.handle_asset_download),
             ]
         )
         return app
@@ -1314,7 +1317,8 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             },
         )
         self.assertEqual(ota_response.status, 200)
-        activation = (await ota_response.json())["activation"]
+        ota_payload = await ota_response.json()
+        activation = ota_payload["activation"]
         self.assertRegex(activation["code"], r"^\d{6}$")
         self.assertEqual(activation["timeout_ms"], 30000)
         self.assertTrue(activation["challenge"])
@@ -1444,6 +1448,10 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         ota_payload = await ota_response.json()
         self.assertEqual(ota_payload["firmware"]["version"], "2.1.0")
         self.assertIn("/xiaozhi/ota/download/baize-s3-eye_2.1.0.bin", ota_payload["firmware"]["url"])
+        self.assertEqual(
+            ota_payload["firmware"]["sha256"],
+            __import__("hashlib").sha256(b"demo firmware").hexdigest(),
+        )
 
         app_ota_response = await self.client.get(
             "/api/app/devices/baize_dev_001/ota", headers=self.auth_headers()
@@ -1453,6 +1461,37 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(app_ota["latest_version"], "2.1.0")
         self.assertTrue(app_ota["update_available"])
         self.assertIn("发现可用固件版本 2.1.0", app_ota["release_note"])
+
+    @unittest_run_loop
+    async def test_ota_returns_new_eye_assets_and_serves_package(self):
+        Path(self.asset_dir).mkdir(parents=True, exist_ok=True)
+        package = Path(self.asset_dir, "zhengchen_eye_1.0.0.pack")
+        package.write_bytes(b"BZEA-demo-eye-assets")
+
+        ota_response = await self.client.post(
+            "/xiaozhi/ota/",
+            data=json.dumps(
+                {
+                    "board": {"type": "zhengchen_eye"},
+                    "application": {"version": "2.0.1"},
+                }
+            ),
+            headers={
+                "device-id": "68:ee:8f:5c:71:54",
+                "client-id": "client-assets-001",
+                "Eye-Assets-Version": "0.0.0",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(ota_response.status, 200)
+        payload = await ota_response.json()
+        self.assertEqual(payload["assets"]["version"], "1.0.0")
+        self.assertEqual(payload["assets"]["size"], len(package.read_bytes()))
+        self.assertIn("/xiaozhi/ota/assets/zhengchen_eye_1.0.0.pack", payload["assets"]["url"])
+
+        response = await self.client.get("/xiaozhi/ota/assets/zhengchen_eye_1.0.0.pack")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), package.read_bytes())
 
     @unittest_run_loop
     async def test_app_ota_payload_scans_uploaded_firmware_without_device_ota_check(self):

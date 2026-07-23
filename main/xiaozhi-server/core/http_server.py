@@ -105,6 +105,14 @@ class SimpleHttpServer:
                                 "/xiaozhi/ota/download/{filename}",
                                 self.ota_handler.handle_options,
                             ),
+                            web.get(
+                                "/xiaozhi/ota/assets/{filename}",
+                                self.ota_handler.handle_asset_download,
+                            ),
+                            web.options(
+                                "/xiaozhi/ota/assets/{filename}",
+                                self.ota_handler.handle_options,
+                            ),
                         ]
                     )
                 # 添加路由
