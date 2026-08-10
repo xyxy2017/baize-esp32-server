@@ -1443,7 +1443,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(payload["items"][0]["id"], diary["id"])
 
     @unittest_run_loop
-    async def test_generate_diary_uses_shared_real_device_dialogues_in_demo_mode(self):
+    async def test_generate_diary_does_not_use_another_users_dialogues(self):
         from core.api.app_demo_store import append_dialogue
 
         await self.client.post(
@@ -1467,10 +1467,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             headers=self.auth_headers(),
         )
 
-        self.assertEqual(response.status, 200)
-        diary = await response.json()
-        self.assertEqual(diary["dialogue_count"], 1)
-        self.assertIn("日记功能", diary["summary"])
+        self.assertEqual(response.status, 404)
 
     @unittest_run_loop
     async def test_generate_diary_prefers_meaningful_events_over_asr_noise(self):
