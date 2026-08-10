@@ -102,6 +102,14 @@ app_demo:
   state_path: data/app_demo_state.json
 
 app_mvp:
+  diary_auto_generation:
+    # Generate after the companion has been quiet for 30 minutes at bedtime.
+    enabled: true
+    evening_hour: 22
+    evening_minute: 30
+    quiet_period_minutes: 30
+    scan_interval_seconds: 300
+    lookback_days: 7
   spirit_power:
     # Recommended MVP economy: 36 full-power turns and 2 turns recovered per hour.
     max: 180

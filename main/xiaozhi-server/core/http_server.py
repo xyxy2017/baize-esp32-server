@@ -3,7 +3,11 @@ import time
 import uuid
 from aiohttp import web
 from config.logger import setup_logging
-from core.api.app_demo_store import admin_metrics
+from core.api.app_demo_store import (
+    admin_metrics,
+    auto_generate_due_diaries,
+    diary_auto_generation_settings,
+)
 from core.api.app_demo_handler import AppDemoHandler
 from core.api.health_handler import HealthHandler
 from core.api.ota_handler import OTAHandler
@@ -41,6 +45,8 @@ class SimpleHttpServer:
             return f"ws://{local_ip}:{port}/xiaozhi/v1/"
 
     async def start(self):
+        runner = None
+        diary_scheduler_task = None
         try:
             server_config = self.config["server"]
             read_config_from_api = self.config.get("read_config_from_api", False)
@@ -133,6 +139,9 @@ class SimpleHttpServer:
                 await runner.setup()
                 site = web.TCPSite(runner, host, port)
                 await site.start()
+                diary_scheduler_task = asyncio.create_task(
+                    self._run_diary_scheduler(), name="baize-diary-scheduler"
+                )
 
                 # 保持服务运行
                 while True:
@@ -143,6 +152,39 @@ class SimpleHttpServer:
 
             self.logger.bind(tag=TAG).error(f"错误堆栈: {traceback.format_exc()}")
             raise
+        finally:
+            if diary_scheduler_task is not None:
+                diary_scheduler_task.cancel()
+                await asyncio.gather(diary_scheduler_task, return_exceptions=True)
+            if runner is not None:
+                await runner.cleanup()
+
+    async def _run_diary_scheduler(self):
+        settings = diary_auto_generation_settings(self.config)
+        if not settings["enabled"]:
+            self.logger.bind(tag=TAG).info("自动日记生成已关闭")
+            return
+        self.logger.bind(tag=TAG).info(
+            "自动日记生成已启动：{:02d}:{:02d}，静默 {} 分钟，扫描间隔 {} 秒",
+            settings["evening_hour"],
+            settings["evening_minute"],
+            settings["quiet_period_minutes"],
+            settings["scan_interval_seconds"],
+        )
+        while True:
+            try:
+                diaries = await asyncio.to_thread(auto_generate_due_diaries, self.config)
+                if diaries:
+                    self.logger.bind(tag=TAG).info(
+                        "自动生成或更新日记 {} 篇：{}",
+                        len(diaries),
+                        ",".join(item["date"] for item in diaries),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.bind(tag=TAG).error(f"自动日记生成失败: {exc}")
+            await asyncio.sleep(settings["scan_interval_seconds"])
 
     async def handle_metrics(self, request):
         remote = request.remote or ""

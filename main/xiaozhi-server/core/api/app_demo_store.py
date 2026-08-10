@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 import glob
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict
 from zoneinfo import ZoneInfo
 
@@ -42,6 +42,11 @@ SMS_DEFAULT_RESEND_INTERVAL_SECONDS = 60
 SMS_DEFAULT_MAX_PER_PHONE_HOUR = 5
 SMS_DEFAULT_MAX_PER_PHONE_DAY = 10
 SMS_DEFAULT_MAX_PER_IP_HOUR = 30
+DIARY_AUTO_EVENING_HOUR = 22
+DIARY_AUTO_EVENING_MINUTE = 30
+DIARY_AUTO_QUIET_MINUTES = 30
+DIARY_AUTO_SCAN_INTERVAL_SECONDS = 300
+DIARY_AUTO_LOOKBACK_DAYS = 7
 
 MVP_EMOTIONS = {"neutral", "happy", "thinking", "surprised", "sad", "sleepy", "confused"}
 EMOTION_ALIASES = {
@@ -116,6 +121,44 @@ def product_day_key(value: datetime | None = None) -> str:
 
 def today_key() -> str:
     return product_day_key()
+
+
+def diary_date_key(value: datetime | None = None) -> str:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(PRODUCT_TIMEZONE).date().isoformat()
+
+
+def diary_auto_generation_settings(config: dict | None = None) -> Dict[str, Any]:
+    values = ((config or {}).get("app_mvp", {}) or {}).get(
+        "diary_auto_generation", {}
+    ) or {}
+
+    def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            return min(maximum, max(minimum, int(values.get(name, default))))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled": bool(values.get("enabled", True)),
+        "evening_hour": bounded_int(
+            "evening_hour", DIARY_AUTO_EVENING_HOUR, 0, 23
+        ),
+        "evening_minute": bounded_int(
+            "evening_minute", DIARY_AUTO_EVENING_MINUTE, 0, 59
+        ),
+        "quiet_period_minutes": bounded_int(
+            "quiet_period_minutes", DIARY_AUTO_QUIET_MINUTES, 1, 24 * 60
+        ),
+        "scan_interval_seconds": bounded_int(
+            "scan_interval_seconds", DIARY_AUTO_SCAN_INTERVAL_SECONDS, 30, 3600
+        ),
+        "lookback_days": bounded_int(
+            "lookback_days", DIARY_AUTO_LOOKBACK_DAYS, 1, 30
+        ),
+    }
 
 
 def spirit_power_settings(config: dict | None = None) -> Dict[str, int]:
@@ -346,6 +389,8 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
             emotion TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_dialogues_owner_created_at
+            ON dialogues(user_id, device_id, created_at);
         CREATE TABLE IF NOT EXISTS diaries (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -1700,9 +1745,9 @@ def configured_hardware_settings(config: dict, device_id: str) -> Dict[str, int]
 
 def _date_from_iso(value: str) -> str:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+        return diary_date_key(datetime.fromisoformat(value.replace("Z", "+00:00")))
     except Exception:
-        return today_key()
+        return diary_date_key()
 
 
 def _latest_bound_user_for_device(conn: sqlite3.Connection, device_id: str) -> str:
@@ -2222,7 +2267,9 @@ def generate_diary(
 ) -> Dict[str, Any]:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
+    was_created = False
     with _connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         device_id = device_id or DEMO_DEVICE_ID
         user_id = user_id or _latest_bound_user_for_device(conn, device_id)
         shared_device_dialogues = False
@@ -2265,6 +2312,7 @@ def generate_diary(
             "SELECT id FROM diaries WHERE user_id = ? AND device_id = ? AND date = ?",
             (user_id, device_id, diary_date),
         ).fetchone()
+        was_created = existing is None
         diary_id = existing["id"] if existing else f"diary_{uuid.uuid4().hex}"
         conn.execute(
             """
@@ -2294,7 +2342,8 @@ def generate_diary(
             ),
         )
         conn.commit()
-    add_intimacy(config, user_id, device_id, 3, "generate_diary")
+    if was_created:
+        add_intimacy(config, user_id, device_id, 3, "generate_diary")
     from core.telemetry import diary_generated
 
     diary_generated()
@@ -2309,6 +2358,105 @@ def generate_diary(
         "baize_note": _compose_baize_note(primary_emotion, len(dialogues)),
         "generated_at": generated_at,
     }
+
+
+def auto_generate_due_diaries(
+    config: dict, now: datetime | None = None
+) -> list[Dict[str, Any]]:
+    """Generate or refresh diaries after the evening quiet window.
+
+    The scan is database-driven, so a service restart catches up recent missed days.
+    """
+    settings = diary_auto_generation_settings(config)
+    if not settings["enabled"]:
+        return []
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    local_now = current.astimezone(PRODUCT_TIMEZONE)
+    today = local_now.date()
+    evening_start = datetime.combine(
+        today,
+        time(settings["evening_hour"], settings["evening_minute"]),
+        tzinfo=PRODUCT_TIMEZONE,
+    )
+    quiet_period = timedelta(minutes=settings["quiet_period_minutes"])
+    earliest_date = today - timedelta(days=settings["lookback_days"] - 1)
+    earliest_created_at = datetime.combine(
+        earliest_date, time.min, tzinfo=PRODUCT_TIMEZONE
+    ).astimezone(timezone.utc).isoformat()
+
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    grouped: Dict[tuple[str, str, str], list[Dict[str, Any]]] = {}
+    existing_counts: Dict[tuple[str, str, str], int] = {}
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT dlg.*
+            FROM dialogues dlg
+            JOIN user_device_bindings binding
+              ON binding.user_id = dlg.user_id AND binding.device_id = dlg.device_id
+            WHERE dlg.created_at >= ?
+            ORDER BY dlg.created_at ASC
+            """,
+            (earliest_created_at,),
+        ).fetchall()
+        for row in rows:
+            item = dict(row)
+            if is_legacy_xiaozhi_dialogue(item):
+                continue
+            diary_date = _date_from_iso(item["created_at"])
+            try:
+                day = date.fromisoformat(diary_date)
+            except ValueError:
+                continue
+            if day < earliest_date or day > today:
+                continue
+            key = (item["user_id"], item["device_id"], diary_date)
+            grouped.setdefault(key, []).append(item)
+
+        if grouped:
+            diary_rows = conn.execute(
+                """
+                SELECT user_id, device_id, date, dialogue_count
+                FROM diaries
+                WHERE date >= ? AND date <= ?
+                """,
+                (earliest_date.isoformat(), today.isoformat()),
+            ).fetchall()
+            existing_counts = {
+                (row["user_id"], row["device_id"], row["date"]): int(
+                    row["dialogue_count"]
+                )
+                for row in diary_rows
+            }
+
+    generated = []
+    for (user_id, device_id, diary_date), dialogues in grouped.items():
+        if existing_counts.get((user_id, device_id, diary_date), 0) >= len(dialogues):
+            continue
+        latest_at = datetime.fromisoformat(
+            dialogues[-1]["created_at"].replace("Z", "+00:00")
+        )
+        if latest_at.tzinfo is None:
+            latest_at = latest_at.replace(tzinfo=timezone.utc)
+        if current - latest_at.astimezone(timezone.utc) < quiet_period:
+            continue
+        day = date.fromisoformat(diary_date)
+        if day == today and local_now < evening_start:
+            continue
+        diary = generate_diary(
+            config,
+            diary_date=diary_date,
+            user_id=user_id,
+            device_id=device_id,
+        )
+        if diary:
+            generated.append(diary)
+    return generated
 
 
 def list_diaries(config: dict, user_id: str, device_id: str) -> list[Dict[str, Any]] | None:

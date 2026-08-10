@@ -6,6 +6,7 @@ import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 from aiohttp import web
@@ -61,6 +62,111 @@ class SpiritPowerRuleTest(unittest.TestCase):
         self.assertEqual(spirit_power_cost_for_seconds(1), 5)
         self.assertEqual(spirit_power_cost_for_seconds(60), 5)
         self.assertEqual(spirit_power_cost_for_seconds(61), 10)
+
+
+class DiaryAndSpiritPowerRuleTest(unittest.TestCase):
+    def test_diary_date_uses_shanghai_calendar_day(self):
+        from core.api.app_demo_store import diary_date_key
+
+        value = datetime(2026, 8, 10, 16, 30, tzinfo=timezone.utc)
+        self.assertEqual(diary_date_key(value), "2026-08-11")
+
+    def test_evening_quiet_window_generates_and_refreshes_once(self):
+        from core.api.app_demo_store import (
+            DEMO_DEVICE_ID,
+            DEMO_USER_ID,
+            append_dialogue,
+            app_mvp_db_path_from_config,
+            auto_generate_due_diaries,
+            bind_device,
+            ensure_db,
+            list_diaries,
+        )
+
+        shanghai = ZoneInfo("Asia/Shanghai")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "app_mvp": {
+                    "db_path": str(Path(temp_dir) / "auto-diary.sqlite3"),
+                    "diary_auto_generation": {
+                        "evening_hour": 22,
+                        "evening_minute": 30,
+                        "quiet_period_minutes": 30,
+                        "lookback_days": 7,
+                    },
+                }
+            }
+            ensure_db(app_mvp_db_path_from_config(config))
+            bind_device(config, DEMO_USER_ID, "123456")
+            first = append_dialogue(
+                config,
+                source_device_id="68:ee:8f:5c:71:54",
+                session_id="auto-diary-1",
+                user_text="今天把自动日记做好了。",
+                baize_text="太好了，我会把这件事记下来。",
+                emotion="happy",
+                user_id=DEMO_USER_ID,
+                device_id=DEMO_DEVICE_ID,
+            )
+            with sqlite3.connect(app_mvp_db_path_from_config(config)) as conn:
+                conn.execute(
+                    "UPDATE dialogues SET created_at = ? WHERE id = ?",
+                    ("2026-08-10T13:00:00+00:00", first["id"]),
+                )
+
+            before_evening = datetime(2026, 8, 10, 22, 20, tzinfo=shanghai)
+            self.assertEqual(auto_generate_due_diaries(config, before_evening), [])
+
+            first_run = auto_generate_due_diaries(
+                config, datetime(2026, 8, 10, 23, 0, tzinfo=shanghai)
+            )
+            self.assertEqual(len(first_run), 1)
+            self.assertEqual(first_run[0]["dialogue_count"], 1)
+            diary_id = first_run[0]["id"]
+            self.assertEqual(
+                auto_generate_due_diaries(
+                    config, datetime(2026, 8, 10, 23, 5, tzinfo=shanghai)
+                ),
+                [],
+            )
+
+            second = append_dialogue(
+                config,
+                source_device_id="68:ee:8f:5c:71:54",
+                session_id="auto-diary-2",
+                user_text="晚上又补了一轮对话。",
+                baize_text="嗯，我也会补进今天的小记里。",
+                emotion="happy",
+                user_id=DEMO_USER_ID,
+                device_id=DEMO_DEVICE_ID,
+            )
+            with sqlite3.connect(app_mvp_db_path_from_config(config)) as conn:
+                conn.execute(
+                    "UPDATE dialogues SET created_at = ? WHERE id = ?",
+                    ("2026-08-10T15:10:00+00:00", second["id"]),
+                )
+
+            self.assertEqual(
+                auto_generate_due_diaries(
+                    config, datetime(2026, 8, 10, 23, 20, tzinfo=shanghai)
+                ),
+                [],
+            )
+            refreshed = auto_generate_due_diaries(
+                config, datetime(2026, 8, 10, 23, 45, tzinfo=shanghai)
+            )
+            self.assertEqual(len(refreshed), 1)
+            self.assertEqual(refreshed[0]["id"], diary_id)
+            self.assertEqual(refreshed[0]["dialogue_count"], 2)
+            self.assertEqual(
+                list_diaries(config, DEMO_USER_ID, DEMO_DEVICE_ID)[0]["id"],
+                diary_id,
+            )
+            with sqlite3.connect(app_mvp_db_path_from_config(config)) as conn:
+                intimacy_events = conn.execute(
+                    "SELECT COUNT(*) FROM intimacy_events WHERE reason = 'generate_diary'"
+                ).fetchone()[0]
+            self.assertEqual(intimacy_events, 1)
 
     def test_spirit_power_economy_loads_from_config(self):
         from core.api.app_demo_store import (
