@@ -6,7 +6,11 @@ import re
 from concurrent.futures import Future
 from core.utils.util import get_vision_url, sanitize_tool_name
 from core.utils.auth import AuthToken
-from core.api.app_demo_store import update_device_report
+from core.api.app_demo_store import (
+    configured_hardware_settings,
+    resolve_bound_app_device,
+    update_device_report,
+)
 from config.logger import setup_logging
 from typing import TYPE_CHECKING
 
@@ -351,6 +355,7 @@ async def handle_mcp_message(
                     await mcp_client.set_ready(True)
                     logger.bind(tag=TAG).debug("所有工具已获取，MCP客户端准备就绪")
                     asyncio.create_task(_refresh_device_status_report(conn, mcp_client))
+                    asyncio.create_task(_replay_saved_hardware_settings(conn, mcp_client))
 
                     # 刷新工具缓存，确保MCP工具被包含在函数列表中
                     if hasattr(conn, "func_handler") and conn.func_handler:
@@ -457,6 +462,35 @@ async def _refresh_device_status_report(conn: "ConnectionHandler", mcp_client: M
         )
     except Exception as e:
         logger.bind(tag=TAG).warning(f"刷新设备状态失败: {e}")
+
+
+async def _replay_saved_hardware_settings(conn: "ConnectionHandler", mcp_client: MCPClient):
+    """Apply App values saved while a device was offline after MCP becomes ready."""
+    try:
+        device = resolve_bound_app_device(
+            conn.config,
+            source_device_id=getattr(conn, "device_id", "") or "",
+            client_id=getattr(conn, "headers", {}).get("client-id", ""),
+        )
+        if not device:
+            return
+        desired = configured_hardware_settings(conn.config, device["id"])
+        tool_mapping = {
+            "speaker_volume": ("self_audio_speaker_set_volume", "volume"),
+            "screen_brightness": ("self_screen_set_brightness", "brightness"),
+        }
+        for setting_key, value in desired.items():
+            tool_name, argument_name = tool_mapping[setting_key]
+            if mcp_client.has_tool(tool_name):
+                await call_mcp_tool(
+                    conn,
+                    mcp_client,
+                    tool_name,
+                    {argument_name: value},
+                    timeout=5,
+                )
+    except Exception as e:
+        logger.bind(tag=TAG).warning(f"恢复 App 设备设置失败: {e}")
 
 
 async def call_mcp_tool(

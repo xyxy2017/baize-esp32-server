@@ -3,6 +3,7 @@ import os
 import re
 import hashlib
 import hmac
+import secrets
 import sqlite3
 import uuid
 import glob
@@ -33,6 +34,14 @@ PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
 USER_ROLE = "user"
 ADMIN_ROLE = "admin"
 VALID_ROLES = {USER_ROLE, ADMIN_ROLE}
+SMS_PURPOSE_LOGIN = "login"
+SMS_CODE_LENGTH = 6
+SMS_CODE_MAX_ATTEMPTS = 5
+SMS_DEFAULT_TTL_SECONDS = 300
+SMS_DEFAULT_RESEND_INTERVAL_SECONDS = 60
+SMS_DEFAULT_MAX_PER_PHONE_HOUR = 5
+SMS_DEFAULT_MAX_PER_PHONE_DAY = 10
+SMS_DEFAULT_MAX_PER_IP_HOUR = 30
 
 MVP_EMOTIONS = {"neutral", "happy", "thinking", "surprised", "sad", "sleepy", "confused"}
 EMOTION_ALIASES = {
@@ -109,9 +118,40 @@ def today_key() -> str:
     return product_day_key()
 
 
-def spirit_power_cost_for_seconds(valid_user_audio_seconds: float | int | None) -> int:
+def spirit_power_settings(config: dict | None = None) -> Dict[str, int]:
+    config = config or {}
+    values = (config.get("app_mvp", {}) or {}).get("spirit_power", {}) or {}
+
+    def positive_int(name: str, default: int) -> int:
+        try:
+            return max(1, int(values.get(name, default)))
+        except (TypeError, ValueError):
+            return default
+
+    limit = positive_int("max", SPIRIT_POWER_LIMIT)
+    return {
+        "max": limit,
+        "initial": min(limit, positive_int("initial", limit)),
+        "recovery_per_hour": positive_int(
+            "recovery_per_hour", SPIRIT_POWER_RECOVERY_PER_HOUR
+        ),
+        "conversation_cost": positive_int(
+            "conversation_cost", SPIRIT_POWER_PER_MINUTE
+        ),
+        "spirit_dew_amount": positive_int("spirit_dew_amount", SPIRIT_DEW_AMOUNT),
+    }
+
+
+def spirit_power_conversation_cost(config: dict | None = None) -> int:
+    return spirit_power_settings(config)["conversation_cost"]
+
+
+def spirit_power_cost_for_seconds(
+    valid_user_audio_seconds: float | int | None, config: dict | None = None
+) -> int:
     seconds = max(0.0, float(valid_user_audio_seconds or 0))
-    return max(SPIRIT_POWER_PER_MINUTE, math.ceil(seconds / 60) * SPIRIT_POWER_PER_MINUTE)
+    per_minute = spirit_power_conversation_cost(config)
+    return max(per_minute, math.ceil(seconds / 60) * per_minute)
 
 
 def app_mvp_db_path_from_config(config: dict) -> str:
@@ -244,6 +284,23 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sms_verification_requests (
+            id TEXT PRIMARY KEY,
+            phone TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            request_ip TEXT,
+            provider_request_id TEXT,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sms_verification_phone_created
+            ON sms_verification_requests(phone, created_at);
+        CREATE INDEX IF NOT EXISTS idx_sms_verification_ip_created
+            ON sms_verification_requests(request_ip, created_at);
         CREATE TABLE IF NOT EXISTS devices (
             id TEXT PRIMARY KEY,
             device_code TEXT NOT NULL UNIQUE,
@@ -267,12 +324,16 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
             bound_at TEXT NOT NULL,
             PRIMARY KEY(user_id, device_id)
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_device_bindings_device_unique
+            ON user_device_bindings(device_id);
         CREATE TABLE IF NOT EXISTS device_settings (
             device_id TEXT PRIMARY KEY,
             baize_nickname TEXT NOT NULL,
             user_call_name TEXT NOT NULL,
             personality_mode TEXT NOT NULL,
-            tts_voice TEXT NOT NULL DEFAULT 'Sambert 知颖'
+            tts_voice TEXT NOT NULL DEFAULT 'Sambert 知颖',
+            speaker_volume INTEGER,
+            screen_brightness INTEGER
         );
         CREATE TABLE IF NOT EXISTS dialogues (
             id TEXT PRIMARY KEY,
@@ -404,11 +465,15 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     energy_columns = _table_columns(conn, "energy_accounts")
     if "last_hourly_recovered_at" not in energy_columns:
         conn.execute("ALTER TABLE energy_accounts ADD COLUMN last_hourly_recovered_at TEXT")
+    settings_columns = _table_columns(conn, "device_settings")
+    if "speaker_volume" not in settings_columns:
+        conn.execute("ALTER TABLE device_settings ADD COLUMN speaker_volume INTEGER")
+    if "screen_brightness" not in settings_columns:
+        conn.execute("ALTER TABLE device_settings ADD COLUMN screen_brightness INTEGER")
     now = now_iso()
     product_day = product_day_key()
     legacy_accounts = conn.execute(
-        "SELECT user_id, current_energy FROM energy_accounts WHERE daily_limit != ?",
-        (SPIRIT_POWER_LIMIT,),
+        "SELECT user_id, current_energy FROM energy_accounts WHERE daily_limit = 30"
     ).fetchall()
     for account in legacy_accounts:
         delta = SPIRIT_POWER_LIMIT - account["current_energy"]
@@ -492,6 +557,297 @@ def _verify_password(password: str, password_hash: str | None) -> bool:
         return False
     actual = _hash_password(password, salt).split("$", 2)[2]
     return hmac.compare_digest(actual, expected)
+
+
+def _sms_settings(config: dict) -> Dict[str, int]:
+    settings = config.get("app_mvp", {}).get("sms", {}) or {}
+
+    def positive_int(name: str, default: int) -> int:
+        try:
+            value = int(settings.get(name, default))
+        except (TypeError, ValueError):
+            return default
+        return max(1, value)
+
+    return {
+        "code_ttl_seconds": positive_int(
+            "code_ttl_seconds", SMS_DEFAULT_TTL_SECONDS
+        ),
+        "resend_interval_seconds": positive_int(
+            "resend_interval_seconds", SMS_DEFAULT_RESEND_INTERVAL_SECONDS
+        ),
+        "max_per_phone_hour": positive_int(
+            "max_per_phone_hour", SMS_DEFAULT_MAX_PER_PHONE_HOUR
+        ),
+        "max_per_phone_day": positive_int(
+            "max_per_phone_day", SMS_DEFAULT_MAX_PER_PHONE_DAY
+        ),
+        "max_per_ip_hour": positive_int(
+            "max_per_ip_hour", SMS_DEFAULT_MAX_PER_IP_HOUR
+        ),
+    }
+
+
+class SMSRateLimitError(ValueError):
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        super().__init__(
+            f"验证码发送过于频繁，请在 {self.retry_after_seconds} 秒后重试"
+        )
+
+
+def create_sms_verification_request(
+    config: dict,
+    phone: str,
+    purpose: str,
+    request_ip: str | None,
+) -> Dict[str, Any]:
+    phone = validate_phone(phone)
+    if purpose != SMS_PURPOSE_LOGIN:
+        raise ValueError("purpose 不支持")
+    request_ip = (request_ip or "").strip()[:64] or None
+    settings = _sms_settings(config)
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    current = datetime.now(timezone.utc).replace(microsecond=0)
+    now = current.isoformat()
+    one_hour_ago = (current - timedelta(hours=1)).isoformat()
+    one_day_ago = (current - timedelta(days=1)).isoformat()
+
+    with _connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        latest = conn.execute(
+            """
+            SELECT created_at FROM sms_verification_requests
+            WHERE phone = ? AND status IN ('pending', 'sent')
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (phone,),
+        ).fetchone()
+        if latest:
+            latest_at = datetime.fromisoformat(latest["created_at"])
+            elapsed = int((current - latest_at).total_seconds())
+            if elapsed < settings["resend_interval_seconds"]:
+                raise SMSRateLimitError(
+                    settings["resend_interval_seconds"] - elapsed
+                )
+
+        phone_hour_count = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM sms_verification_requests
+            WHERE phone = ? AND status IN ('pending', 'sent', 'consumed', 'superseded')
+              AND created_at >= ?
+            """,
+            (phone, one_hour_ago),
+        ).fetchone()["c"]
+        if phone_hour_count >= settings["max_per_phone_hour"]:
+            raise SMSRateLimitError(3600)
+
+        phone_day_count = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM sms_verification_requests
+            WHERE phone = ? AND status IN ('pending', 'sent', 'consumed', 'superseded')
+              AND created_at >= ?
+            """,
+            (phone, one_day_ago),
+        ).fetchone()["c"]
+        if phone_day_count >= settings["max_per_phone_day"]:
+            raise SMSRateLimitError(86400)
+
+        if request_ip:
+            ip_hour_count = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM sms_verification_requests
+                WHERE request_ip = ?
+                  AND status IN ('pending', 'sent', 'consumed', 'superseded')
+                  AND created_at >= ?
+                """,
+                (request_ip, one_hour_ago),
+            ).fetchone()["c"]
+            if ip_hour_count >= settings["max_per_ip_hour"]:
+                raise SMSRateLimitError(3600)
+
+        code = f"{secrets.randbelow(10 ** SMS_CODE_LENGTH):0{SMS_CODE_LENGTH}d}"
+        request_id = f"sms_{uuid.uuid4().hex}"
+        expires_at = (
+            current + timedelta(seconds=settings["code_ttl_seconds"])
+        ).isoformat()
+        conn.execute(
+            """
+            INSERT INTO sms_verification_requests(
+                id, phone, purpose, code_hash, request_ip, status,
+                attempts, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            """,
+            (
+                request_id,
+                phone,
+                purpose,
+                _hash_password(code),
+                request_ip,
+                now,
+                expires_at,
+            ),
+        )
+        conn.commit()
+    return {
+        "request_id": request_id,
+        "phone": phone,
+        "code": code,
+        "expires_in_seconds": settings["code_ttl_seconds"],
+        "retry_after_seconds": settings["resend_interval_seconds"],
+    }
+
+
+def mark_sms_verification_sent(
+    config: dict, request_id: str, provider_request_id: str | None
+) -> None:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT phone, purpose FROM sms_verification_requests
+            WHERE id = ? AND status = 'pending'
+            """,
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("验证码请求状态无效")
+        conn.execute(
+            """
+            UPDATE sms_verification_requests
+            SET status = 'superseded'
+            WHERE phone = ? AND purpose = ? AND status = 'sent' AND id != ?
+            """,
+            (row["phone"], row["purpose"], request_id),
+        )
+        conn.execute(
+            """
+            UPDATE sms_verification_requests
+            SET status = 'sent', provider_request_id = ?
+            WHERE id = ?
+            """,
+            ((provider_request_id or "")[:128] or None, request_id),
+        )
+        conn.commit()
+
+
+def mark_sms_verification_failed(config: dict, request_id: str) -> None:
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE sms_verification_requests
+            SET status = 'failed'
+            WHERE id = ? AND status = 'pending'
+            """,
+            (request_id,),
+        )
+        conn.commit()
+
+
+def verify_sms_code_and_login(
+    config: dict,
+    phone: str,
+    code: str,
+    nickname: str = "",
+    purpose: str = SMS_PURPOSE_LOGIN,
+) -> Dict[str, Any]:
+    phone = validate_phone(phone)
+    code = re.sub(r"\D", "", code or "")
+    if len(code) != SMS_CODE_LENGTH:
+        raise ValueError("验证码无效或已过期")
+    if purpose != SMS_PURPOSE_LOGIN:
+        raise ValueError("验证码无效或已过期")
+
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    now = now_iso()
+    with _connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        verification = conn.execute(
+            """
+            SELECT * FROM sms_verification_requests
+            WHERE phone = ? AND purpose = ? AND status = 'sent'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (phone, purpose),
+        ).fetchone()
+        if (
+            verification is None
+            or verification["expires_at"] <= now
+            or verification["attempts"] >= SMS_CODE_MAX_ATTEMPTS
+        ):
+            raise ValueError("验证码无效或已过期")
+        if not _verify_password(code, verification["code_hash"]):
+            attempts = verification["attempts"] + 1
+            status = "locked" if attempts >= SMS_CODE_MAX_ATTEMPTS else "sent"
+            conn.execute(
+                """
+                UPDATE sms_verification_requests
+                SET attempts = ?, status = ?
+                WHERE id = ?
+                """,
+                (attempts, status, verification["id"]),
+            )
+            conn.commit()
+            raise ValueError("验证码无效或已过期")
+
+        conn.execute(
+            """
+            UPDATE sms_verification_requests
+            SET status = 'consumed', consumed_at = ?
+            WHERE id = ?
+            """,
+            (now, verification["id"]),
+        )
+        sync_configured_admin_roles(config, conn)
+        row = conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
+        is_new_user = row is None
+        if is_new_user:
+            user_id = f"user_{uuid.uuid4().hex}"
+            display_name = (nickname or "").strip() or mask_phone(phone)
+            conn.execute(
+                """
+                INSERT INTO users(
+                    id, nickname, login_type, invite_code, phone, password_hash,
+                    password_updated_at, role, created_at, last_login_at
+                ) VALUES (?, ?, 'phone_sms', '', ?, NULL, NULL, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    display_name,
+                    phone,
+                    role_for_phone(config, phone),
+                    now,
+                    now,
+                ),
+            )
+        else:
+            user_id = row["id"]
+            conn.execute(
+                """
+                UPDATE users
+                SET last_login_at = ?, login_type = 'phone_sms', role = ?
+                WHERE id = ?
+                """,
+                (now, role_for_phone(config, phone), user_id),
+            )
+        _ensure_energy(conn, user_id, config)
+        token, expires_at = _issue_token(conn, user_id, now)
+        conn.commit()
+        user = _row_to_user(
+            conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        )
+    return {
+        "token": token,
+        "expires_at": expires_at,
+        "is_new_user": is_new_user,
+        "user": user,
+    }
 
 
 def ensure_db(db_path: str) -> None:
@@ -582,7 +938,8 @@ def _progress_for_score(score: int) -> Dict[str, Any]:
     return {"level": "初识", "score": score, "level_min": 0, "level_max": 100, "progress": score / 100}
 
 
-def _ensure_energy(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
+def _ensure_energy(conn: sqlite3.Connection, user_id: str, config: dict) -> sqlite3.Row:
+    settings = spirit_power_settings(config)
     row = conn.execute("SELECT * FROM energy_accounts WHERE user_id = ?", (user_id,)).fetchone()
     today = product_day_key()
     now = now_iso()
@@ -594,10 +951,33 @@ def _ensure_energy(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
                 last_recovered_on, last_hourly_recovered_at
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (user_id, INITIAL_SPIRIT_POWER, SPIRIT_POWER_LIMIT, now, today, now),
+            (user_id, settings["initial"], settings["max"], now, today, now),
         )
         conn.commit()
-    elif row["last_recovered_on"] != today:
+        row = conn.execute("SELECT * FROM energy_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    elif row["daily_limit"] != settings["max"]:
+        adjusted = min(
+            settings["max"],
+            max(0, row["current_energy"] + settings["max"] - row["daily_limit"]),
+        )
+        delta = adjusted - row["current_energy"]
+        conn.execute(
+            """
+            UPDATE energy_accounts
+            SET current_energy = ?, daily_limit = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (adjusted, settings["max"], now, user_id),
+        )
+        if delta:
+            conn.execute(
+                "INSERT INTO energy_events(id, user_id, delta, reason, created_at) VALUES (?, ?, ?, 'spirit_power_config_adjustment', ?)",
+                (f"energy_{uuid.uuid4().hex}", user_id, delta, now),
+            )
+        conn.commit()
+        row = conn.execute("SELECT * FROM energy_accounts WHERE user_id = ?", (user_id,)).fetchone()
+
+    if row["last_recovered_on"] != today:
         delta = max(0, row["daily_limit"] - row["current_energy"])
         conn.execute(
             """
@@ -626,7 +1006,7 @@ def _ensure_energy(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
         if elapsed_hours > 0:
             recovered = min(
                 row["daily_limit"] - row["current_energy"],
-                elapsed_hours * SPIRIT_POWER_RECOVERY_PER_HOUR,
+                elapsed_hours * settings["recovery_per_hour"],
             )
             recovered_at = (last_hourly + timedelta(hours=elapsed_hours)).replace(microsecond=0).isoformat()
             conn.execute(
@@ -646,8 +1026,9 @@ def _ensure_energy(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
     return conn.execute("SELECT * FROM energy_accounts WHERE user_id = ?", (user_id,)).fetchone()
 
 
-def _spirit_power_payload(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
-    row = _ensure_energy(conn, user_id)
+def _spirit_power_payload(conn: sqlite3.Connection, user_id: str, config: dict) -> Dict[str, Any]:
+    settings = spirit_power_settings(config)
+    row = _ensure_energy(conn, user_id, config)
     today = product_day_key()
     inventory_count = conn.execute(
         """
@@ -664,24 +1045,26 @@ def _spirit_power_payload(conn: sqlite3.Connection, user_id: str) -> Dict[str, A
         "current": row["current_energy"],
         "daily_limit": row["daily_limit"],
         "max": row["daily_limit"],
-        "recovery_per_hour": SPIRIT_POWER_RECOVERY_PER_HOUR,
+        "recovery_per_hour": settings["recovery_per_hour"],
+        "conversation_cost": settings["conversation_cost"],
+        "product_day_boundary_hour": PRODUCT_DAY_BOUNDARY_HOUR,
         "updated_at": row["updated_at"],
         "last_recovered_on": row["last_recovered_on"],
         "checked_in_today": checked_in,
         "spirit_dew_count": inventory_count,
-        "spirit_dew_amount": SPIRIT_DEW_AMOUNT,
+        "spirit_dew_amount": settings["spirit_dew_amount"],
     }
 
 
-def _energy_payload(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
-    return _spirit_power_payload(conn, user_id)
+def _energy_payload(conn: sqlite3.Connection, user_id: str, config: dict) -> Dict[str, Any]:
+    return _spirit_power_payload(conn, user_id, config)
 
 
 def consume_energy(config: dict, user_id: str, device_id: str | None, amount: int, reason: str) -> bool:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
-        account = _ensure_energy(conn, user_id)
+        account = _ensure_energy(conn, user_id, config)
         if account["current_energy"] < amount:
             return False
         now = now_iso()
@@ -705,7 +1088,7 @@ def spirit_power_summary(config: dict, user_id: str) -> Dict[str, Any]:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
-        return _spirit_power_payload(conn, user_id)
+        return _spirit_power_payload(conn, user_id, config)
 
 
 def _spirit_power_item_payload(row: sqlite3.Row) -> Dict[str, Any]:
@@ -740,14 +1123,15 @@ def check_in_spirit_power(config: dict, user_id: str) -> Dict[str, Any]:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
-        _ensure_energy(conn, user_id)
+        settings = spirit_power_settings(config)
+        _ensure_energy(conn, user_id, config)
         today = product_day_key()
         existing = conn.execute(
             "SELECT item_id FROM spirit_power_checkins WHERE user_id = ? AND product_day = ?",
             (user_id, today),
         ).fetchone()
         if existing:
-            return {"already_checked_in": True, "spirit_power": _spirit_power_payload(conn, user_id)}
+            return {"already_checked_in": True, "spirit_power": _spirit_power_payload(conn, user_id, config)}
         inventory_count = conn.execute(
             """
             SELECT COUNT(*) AS c FROM spirit_power_items
@@ -768,7 +1152,7 @@ def check_in_spirit_power(config: dict, user_id: str) -> Dict[str, Any]:
                 id, user_id, item_type, amount, granted_on, expires_on, created_at
             ) VALUES (?, ?, 'spirit_dew', ?, ?, ?, ?)
             """,
-            (item_id, user_id, SPIRIT_DEW_AMOUNT, today, expires_on, now),
+            (item_id, user_id, settings["spirit_dew_amount"], today, expires_on, now),
         )
         conn.execute(
             "INSERT INTO spirit_power_checkins(user_id, product_day, item_id, created_at) VALUES (?, ?, ?, ?)",
@@ -784,7 +1168,7 @@ def check_in_spirit_power(config: dict, user_id: str) -> Dict[str, Any]:
             "item": _spirit_power_item_payload(
                 conn.execute("SELECT * FROM spirit_power_items WHERE id = ?", (item_id,)).fetchone()
             ),
-            "spirit_power": _spirit_power_payload(conn, user_id),
+            "spirit_power": _spirit_power_payload(conn, user_id, config),
         }
 
 
@@ -792,9 +1176,7 @@ def use_spirit_dew(config: dict, user_id: str, item_id: str | None = None) -> Di
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
-        account = _ensure_energy(conn, user_id)
-        if account["current_energy"] > account["daily_limit"] - SPIRIT_DEW_AMOUNT:
-            raise ValueError(f"当前灵力高于 {account['daily_limit'] - SPIRIT_DEW_AMOUNT} 点，暂时不需要使用白泽灵露")
+        account = _ensure_energy(conn, user_id, config)
         today = product_day_key()
         if item_id:
             item = conn.execute(
@@ -815,6 +1197,8 @@ def use_spirit_dew(config: dict, user_id: str, item_id: str | None = None) -> Di
             ).fetchone()
         if not item:
             raise ValueError("没有可用的白泽灵露")
+        if account["current_energy"] > account["daily_limit"] - item["amount"]:
+            raise ValueError(f"当前灵力高于 {account['daily_limit'] - item['amount']} 点，暂时不需要使用白泽灵露")
         now = now_iso()
         conn.execute("UPDATE spirit_power_items SET used_at = ? WHERE id = ?", (now, item["id"]))
         conn.execute(
@@ -826,7 +1210,7 @@ def use_spirit_dew(config: dict, user_id: str, item_id: str | None = None) -> Di
             (f"energy_{uuid.uuid4().hex}", user_id, item["amount"], now),
         )
         conn.commit()
-        return {"used_item_id": item["id"], "spirit_power": _spirit_power_payload(conn, user_id)}
+        return {"used_item_id": item["id"], "spirit_power": _spirit_power_payload(conn, user_id, config)}
 
 
 def _ensure_intimacy(conn: sqlite3.Connection, user_id: str, device_id: str) -> sqlite3.Row:
@@ -942,7 +1326,7 @@ def register_or_login_user(config: dict, invite_code: str, nickname: str) -> Dic
         else:
             user_id = row["id"]
             conn.execute("UPDATE users SET last_login_at = ?, nickname = ? WHERE id = ?", (now, nickname, user_id))
-        _ensure_energy(conn, user_id)
+        _ensure_energy(conn, user_id, config)
         token = f"mvp_{uuid.uuid4().hex}"
         expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).replace(microsecond=0).isoformat()
         conn.execute(
@@ -988,7 +1372,7 @@ def register_phone_user(config: dict, phone: str, password: str, nickname: str =
             """,
             (user_id, nickname, phone, _hash_password(password), now, role, now, now),
         )
-        _ensure_energy(conn, user_id)
+        _ensure_energy(conn, user_id, config)
         token, expires_at = _issue_token(conn, user_id, now)
         conn.commit()
         user = _row_to_user(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
@@ -1010,7 +1394,7 @@ def login_phone_user(config: dict, phone: str, password: str) -> Dict[str, Any]:
             "UPDATE users SET last_login_at = ?, role = ? WHERE id = ?",
             (now, role_for_phone(config, phone), row["id"]),
         )
-        _ensure_energy(conn, row["id"])
+        _ensure_energy(conn, row["id"], config)
         token, expires_at = _issue_token(conn, row["id"], now)
         conn.commit()
         user = _row_to_user(conn.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone())
@@ -1062,6 +1446,8 @@ def _settings_payload(row: sqlite3.Row | None, device_id: str) -> Dict[str, Any]
             "user_call_name": "小伙伴",
             "personality_mode": "curious",
             "tts_voice": "Sambert 知颖",
+            "speaker_volume": 100,
+            "screen_brightness": 100,
         }
     return {
         "device_id": device_id,
@@ -1069,6 +1455,8 @@ def _settings_payload(row: sqlite3.Row | None, device_id: str) -> Dict[str, Any]
         "user_call_name": row["user_call_name"],
         "personality_mode": row["personality_mode"],
         "tts_voice": row["tts_voice"],
+        "speaker_volume": row["speaker_volume"] if row["speaker_volume"] is not None else 100,
+        "screen_brightness": row["screen_brightness"] if row["screen_brightness"] is not None else 100,
     }
 
 
@@ -1093,28 +1481,6 @@ def _is_bound_conn(conn: sqlite3.Connection, user_id: str, device_id: str) -> bo
         "SELECT 1 FROM user_device_bindings WHERE user_id = ? AND device_id = ?",
         (user_id, device_id),
     ).fetchone() is not None
-
-
-def demo_auto_bind_new_devices_to_all_users(config: dict) -> bool:
-    app_mvp = config.get("app_mvp", {}) or {}
-    app_demo = config.get("app_demo", {}) or {}
-    if "demo_auto_bind_new_devices_to_all_users" in app_mvp:
-        return bool(app_mvp["demo_auto_bind_new_devices_to_all_users"])
-    if "demo_auto_bind_new_devices_to_all_users" in app_demo:
-        return bool(app_demo["demo_auto_bind_new_devices_to_all_users"])
-    return False
-
-
-def _bind_device_to_all_users(conn: sqlite3.Connection, device_id: str) -> None:
-    bound_at = now_iso()
-    rows = conn.execute("SELECT id FROM users ORDER BY created_at, id").fetchall()
-    for row in rows:
-        user_id = row["id"]
-        conn.execute(
-            "INSERT OR IGNORE INTO user_device_bindings(user_id, device_id, bound_at) VALUES (?, ?, ?)",
-            (user_id, device_id, bound_at),
-        )
-        _ensure_intimacy(conn, user_id, device_id)
 
 
 def bind_device(config: dict, user_id: str, device_code: str) -> Dict[str, Any] | None:
@@ -1265,30 +1631,71 @@ def get_settings(config: dict, user_id: str, device_id: str) -> Dict[str, Any] |
         )
 
 
-def update_settings(config: dict, user_id: str, device_id: str, values: Dict[str, str]) -> Dict[str, Any] | None:
+def update_settings(config: dict, user_id: str, device_id: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
         if not _is_bound_conn(conn, user_id, device_id):
             return None
-        current = _settings_payload(conn.execute("SELECT * FROM device_settings WHERE device_id = ?", (device_id,)).fetchone(), device_id)
+        row = conn.execute(
+            "SELECT * FROM device_settings WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        current = _settings_payload(row, device_id)
         for key in ("baize_nickname", "user_call_name", "personality_mode", "tts_voice"):
             if values.get(key) is not None:
                 current[key] = values[key]
+        stored_hardware = {
+            key: row[key] if row is not None else None
+            for key in ("speaker_volume", "screen_brightness")
+        }
+        for key in stored_hardware:
+            if values.get(key) is not None:
+                stored_hardware[key] = values[key]
+                current[key] = values[key]
         conn.execute(
             """
-            INSERT INTO device_settings(device_id, baize_nickname, user_call_name, personality_mode, tts_voice)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO device_settings(
+                device_id, baize_nickname, user_call_name, personality_mode, tts_voice,
+                speaker_volume, screen_brightness
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 baize_nickname = excluded.baize_nickname,
                 user_call_name = excluded.user_call_name,
                 personality_mode = excluded.personality_mode,
-                tts_voice = excluded.tts_voice
+                tts_voice = excluded.tts_voice,
+                speaker_volume = excluded.speaker_volume,
+                screen_brightness = excluded.screen_brightness
             """,
-            (device_id, current["baize_nickname"], current["user_call_name"], current["personality_mode"], current["tts_voice"]),
+            (
+                device_id,
+                current["baize_nickname"],
+                current["user_call_name"],
+                current["personality_mode"],
+                current["tts_voice"],
+                stored_hardware["speaker_volume"],
+                stored_hardware["screen_brightness"],
+            ),
         )
         conn.commit()
         return current
+
+
+def configured_hardware_settings(config: dict, device_id: str) -> Dict[str, int]:
+    """Return only values explicitly saved by the App, for connection-time replay."""
+    db_path = app_mvp_db_path_from_config(config)
+    ensure_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT speaker_volume, screen_brightness FROM device_settings WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if row is None:
+            return {}
+        return {
+            key: int(row[key])
+            for key in ("speaker_volume", "screen_brightness")
+            if row[key] is not None
+        }
 
 
 def _date_from_iso(value: str) -> str:
@@ -1298,17 +1705,18 @@ def _date_from_iso(value: str) -> str:
         return today_key()
 
 
-def _first_bound_user_for_device(conn: sqlite3.Connection, device_id: str) -> str:
+def _latest_bound_user_for_device(conn: sqlite3.Connection, device_id: str) -> str:
     row = conn.execute(
-        "SELECT user_id FROM user_device_bindings WHERE device_id = ? ORDER BY bound_at LIMIT 1",
+        """
+        SELECT user_id
+        FROM user_device_bindings
+        WHERE device_id = ?
+        ORDER BY bound_at DESC, rowid DESC
+        LIMIT 1
+        """,
         (device_id,),
     ).fetchone()
     return row["user_id"] if row else DEMO_USER_ID
-
-
-def _shared_device_dialogues_enabled(config: dict) -> bool:
-    """Demo mode: a real test device is visible to every bound iOS account."""
-    return demo_auto_bind_new_devices_to_all_users(config)
 
 
 def _device_id_for_source(conn: sqlite3.Connection, source_device_id: str) -> str:
@@ -1435,7 +1843,7 @@ def resolve_bound_app_device(
             FROM devices d
             JOIN user_device_bindings b ON b.device_id = d.id
             WHERE d.id = ? OR d.source_device_id = ? OR d.client_id = ? OR d.source_device_id = ? OR d.client_id = ?
-            ORDER BY b.bound_at LIMIT 1
+            ORDER BY b.bound_at DESC, b.rowid DESC LIMIT 1
             """,
             (device_id, source_device_id, source_device_id, client_id, client_id),
         ).fetchone()
@@ -1467,7 +1875,7 @@ def append_dialogue(
     ensure_db(db_path)
     with _connect(db_path) as conn:
         device_id = device_id or _device_id_for_source(conn, source_device_id)
-        user_id = user_id or _first_bound_user_for_device(conn, device_id)
+        user_id = user_id or _latest_bound_user_for_device(conn, device_id)
         created_at = now_iso()
         item = {
             "id": f"dlg_{uuid.uuid4().hex}",
@@ -1510,24 +1918,14 @@ def list_dialogues(config: dict, user_id: str, device_id: str) -> list[Dict[str,
     with _connect(db_path) as conn:
         if not _is_bound_conn(conn, user_id, device_id):
             return None
-        if _shared_device_dialogues_enabled(config):
-            rows = conn.execute(
-                """
-                SELECT * FROM dialogues
-                WHERE device_id = ?
-                ORDER BY created_at DESC LIMIT 100
-                """,
-                (device_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT * FROM dialogues
-                WHERE user_id = ? AND device_id = ?
-                ORDER BY created_at DESC LIMIT 100
-                """,
-                (user_id, device_id),
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT * FROM dialogues
+            WHERE user_id = ? AND device_id = ?
+            ORDER BY created_at DESC LIMIT 100
+            """,
+            (user_id, device_id),
+        ).fetchall()
         return [dict(row) for row in rows if not is_legacy_xiaozhi_dialogue(dict(row))]
 
 
@@ -1826,8 +2224,8 @@ def generate_diary(
     ensure_db(db_path)
     with _connect(db_path) as conn:
         device_id = device_id or DEMO_DEVICE_ID
-        user_id = user_id or _first_bound_user_for_device(conn, device_id)
-        shared_device_dialogues = _shared_device_dialogues_enabled(config) and _is_bound_conn(conn, user_id, device_id)
+        user_id = user_id or _latest_bound_user_for_device(conn, device_id)
+        shared_device_dialogues = False
         if diary_date is None:
             if shared_device_dialogues:
                 latest = conn.execute(
@@ -2055,7 +2453,7 @@ def user_summary(config: dict, user_id: str) -> Dict[str, Any]:
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if not user_row:
             return {}
-        spirit_power = _spirit_power_payload(conn, user_id)
+        spirit_power = _spirit_power_payload(conn, user_id, config)
         return {
             **_row_to_user(user_row),
             "spirit_power": spirit_power,
@@ -2102,7 +2500,6 @@ def update_device_report(
     reported_at = now_iso()
     with _connect(db_path) as conn:
         row = _find_device_row_for_source(conn, source_device_id=source_device_id, client_id=client_id)
-        should_auto_bind_all_users = False
         if row is None:
             if (source_device_id or "").strip() or (client_id or "").strip():
                 row = _claimable_seed_device_row(conn)
@@ -2116,14 +2513,9 @@ def update_device_report(
                         firmware_version=firmware_version,
                         online_status="online",
                     )
-                    should_auto_bind_all_users = demo_auto_bind_new_devices_to_all_users(config)
-                else:
-                    should_auto_bind_all_users = demo_auto_bind_new_devices_to_all_users(config)
             else:
                 row = conn.execute("SELECT * FROM devices WHERE id = ?", (DEMO_DEVICE_ID,)).fetchone()
         device_id = row["id"]
-        if should_auto_bind_all_users:
-            _bind_device_to_all_users(conn, device_id)
         clean_battery = max(0, min(100, int(battery_percent))) if battery_percent is not None else row["battery_percent"]
         clean_version = firmware_version or row["firmware_version"]
         clean_activity_status = (activity_status or row["activity_status"] or "unknown").strip() or "unknown"
@@ -2182,7 +2574,13 @@ def device_activation_state(
         if row is None:
             return None
         owner = conn.execute(
-            "SELECT user_id, bound_at FROM user_device_bindings WHERE device_id = ? ORDER BY bound_at LIMIT 1",
+            """
+            SELECT user_id, bound_at
+            FROM user_device_bindings
+            WHERE device_id = ?
+            ORDER BY bound_at DESC, rowid DESC
+            LIMIT 1
+            """,
             (row["id"],),
         ).fetchone()
         return {

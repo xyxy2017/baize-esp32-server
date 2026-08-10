@@ -44,7 +44,15 @@ from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
 from core.utils.conversation_metrics import ConversationMetrics
-from core.api.app_demo_store import append_dialogue, clean_baize_text, consume_energy, resolve_bound_app_device, user_summary
+from core.api.app_demo_store import (
+    append_dialogue,
+    clean_baize_text,
+    consume_energy,
+    resolve_bound_app_device,
+    spirit_power_conversation_cost,
+    user_summary,
+)
+from core.voice_dialogue_gate import enqueue_spirit_power_notice
 
 
 TAG = __name__
@@ -941,22 +949,7 @@ class ConnectionHandler:
                 )
             )
             if not self._app_has_energy_for_voice_dialogue():
-                energy_reply = "白泽现在的灵力不足，恢复后再继续陪你聊。"
-                self.tts.tts_text_queue.put(
-                    TTSMessageDTO(
-                        sentence_id=current_sentence_id,
-                        sentence_type=SentenceType.FIRST,
-                        content_type=ContentType.TEXT,
-                        content_detail=energy_reply,
-                    )
-                )
-                self.tts.tts_text_queue.put(
-                    TTSMessageDTO(
-                        sentence_id=current_sentence_id,
-                        sentence_type=SentenceType.LAST,
-                        content_type=ContentType.ACTION,
-                    )
-                )
+                enqueue_spirit_power_notice(self.tts, current_sentence_id)
                 return False
         else:
             # 递归调用时，使用当前的sentence_id
@@ -1339,7 +1332,8 @@ class ConnectionHandler:
             app_device = self._resolve_app_device()
             if not app_device:
                 return
-            if not consume_energy(self.common_config, app_device["user_id"], app_device["id"], 5, "voice_dialogue"):
+            cost = spirit_power_conversation_cost(self.common_config)
+            if not consume_energy(self.common_config, app_device["user_id"], app_device["id"], cost, "voice_dialogue"):
                 self.logger.bind(tag=TAG).warning("App user spirit power is not enough; skip dialogue persistence")
                 return
             append_dialogue(
@@ -1373,7 +1367,8 @@ class ConnectionHandler:
         if not app_device:
             return True
         try:
-            return user_summary(self.common_config, app_device["user_id"])["spirit_power"]["current"] >= 5
+            spirit_power = user_summary(self.common_config, app_device["user_id"])["spirit_power"]
+            return spirit_power["current"] >= spirit_power["conversation_cost"]
         except Exception:
             return True
 

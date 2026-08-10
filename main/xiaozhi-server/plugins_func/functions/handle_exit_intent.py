@@ -1,12 +1,21 @@
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
 from config.logger import setup_logging
 from typing import TYPE_CHECKING
+import random
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 
 TAG = __name__
 logger = setup_logging()
+
+SHORT_GOODBYES = (
+    "下次见呀！",
+    "白泽先歇会儿。",
+    "回头再聊呀！",
+    "我等你回来。",
+    "晚点见啦！",
+)
 
 handle_exit_intent_function_desc = {
     "type": "function",
@@ -18,7 +27,7 @@ handle_exit_intent_function_desc = {
             "properties": {
                 "say_goodbye": {
                     "type": "string",
-                    "description": "和用户友好结束对话的告别语",
+                    "description": "白泽幼灵的一句简短告别语，不超过12个汉字，不要固定开头或扩写",
                 }
             },
             "required": ["say_goodbye"],
@@ -33,8 +42,10 @@ handle_exit_intent_function_desc = {
 def handle_exit_intent(conn: "ConnectionHandler", say_goodbye: str | None = None):
     # 处理退出意图
     try:
-        if say_goodbye is None:
-            say_goodbye = "再见，祝您生活愉快！"
+        if not say_goodbye or len(say_goodbye.strip()) > 16:
+            say_goodbye = random.choice(SHORT_GOODBYES)
+        else:
+            say_goodbye = say_goodbye.strip()
         if not conn.close_after_chat:
             conn.close_after_chat = True
         logger.bind(tag=TAG).info(f"退出意图已处理:{say_goodbye}")

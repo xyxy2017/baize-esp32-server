@@ -30,6 +30,16 @@ cp data/.config.example.yaml data/.config.yaml
 | `ASR.AliyunStreamASR.access_key_secret` | 阿里云 AccessKey Secret |
 | `LLM.AliLLM.api_key` | 阿里云百炼 / DashScope API Key |
 | `TTS.AliBLSambertTTS.api_key` | 阿里云百炼 / DashScope API Key |
+| `app_mvp.sms.sign_name` | 审核通过的阿里云短信签名 |
+| `app_mvp.sms.template_code` | 审核通过的验证码短信模板 Code |
+
+白泽当前审核通过的配置为签名 `燃力猫文化`、模板 `白泽验证码`
+（`SMS_510440112`）、变量名 `code`。模板内容为
+`白泽的验证码为：${code}，请勿泄露于他人！`。
+
+手机验证码短信使用环境变量 `ALIBABA_CLOUD_ACCESS_KEY_ID` 和
+`ALIBABA_CLOUD_ACCESS_KEY_SECRET`。应使用独立 RAM 用户和最小权限，不要把
+AccessKey 写入仓库；签名与模板就绪后再将 `app_mvp.sms.enabled` 设为 `true`。
 
 `data/.config.yaml` 只放在服务器本地，不提交到 Git。里面包含真实密钥。
 

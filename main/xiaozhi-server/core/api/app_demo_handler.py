@@ -15,6 +15,7 @@ from core.api.app_demo_store import (
     bind_device,
     bound_device,
     clean_baize_text,
+    configured_hardware_settings,
     consume_energy,
     check_in_spirit_power,
     create_device,
@@ -31,6 +32,8 @@ from core.api.app_demo_store import (
     list_memories,
     list_spirit_power_items,
     login_phone_user,
+    mark_sms_verification_failed,
+    mark_sms_verification_sent,
     ota_payload,
     register_phone_user,
     register_or_login_user,
@@ -43,11 +46,19 @@ from core.api.app_demo_store import (
     update_settings,
     user_for_token,
     user_summary,
+    create_sms_verification_request,
+    SMSRateLimitError,
     spirit_power_summary,
     use_spirit_dew,
+    verify_sms_code_and_login,
 )
 from core.api.base_handler import BaseHandler
-from core.providers.tools.device_mcp.mcp_handler import _refresh_device_status_report
+from core.api.sms_sender import (
+    AliyunSMSSender,
+    SMSConfigurationError,
+    SMSProviderError,
+)
+from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool, _refresh_device_status_report
 from core.utils import llm as llm_utils
 from core.utils.prompt_manager import PromptManager
 
@@ -64,6 +75,8 @@ class AppDemoHandler(BaseHandler):
         device_registry=None,
         mcp_status_refresher=None,
         demo_runner=None,
+        hardware_settings_applier=None,
+        sms_sender=None,
     ):
         super().__init__(config)
         self.llm_factory = llm_factory or llm_utils.create_instance
@@ -71,6 +84,8 @@ class AppDemoHandler(BaseHandler):
         self.device_registry = device_registry
         self.mcp_status_refresher = mcp_status_refresher or self._refresh_status_from_connection
         self.demo_runner = demo_runner or self._run_demo_on_connection
+        self.hardware_settings_applier = hardware_settings_applier or self._apply_hardware_settings
+        self.sms_sender = sms_sender or AliyunSMSSender(config)
         self._event_subscribers = {}
         if self.device_registry is not None and hasattr(self.device_registry, "subscribe"):
             self.device_registry.subscribe(self._handle_registry_event)
@@ -79,6 +94,8 @@ class AppDemoHandler(BaseHandler):
         return [
             web.post("/api/app/register", self.handle_register),
             web.post("/api/app/login", self.handle_login),
+            web.post("/api/app/auth/sms/send", self.handle_send_sms_code),
+            web.post("/api/app/auth/sms/verify", self.handle_verify_sms_code),
             web.post("/api/app/demo-login", self.handle_demo_login),
             web.get("/api/app/me", self.handle_me),
             web.get("/api/app/spirit-power", self.handle_spirit_power),
@@ -112,6 +129,7 @@ class AppDemoHandler(BaseHandler):
             web.post("/api/app/devices/{device_id}/diaries/generate", self.handle_generate_diary),
             web.get("/api/app/devices/{device_id}/ota", self.handle_ota),
             web.post("/api/app/devices/{device_id}/ota/upgrade", self.handle_ota_upgrade),
+            web.post("/api/app/devices/{device_id}/eye-assets/upgrade", self.handle_eye_assets_upgrade),
             web.post("/api/app/devices/{device_id}/refresh-status", self.handle_refresh_status),
             web.post("/api/app/devices/{device_id}/demo/run", self.handle_demo_run),
             web.post("/api/app/devices/{device_id}/unbind", self.handle_unbind_device),
@@ -151,6 +169,70 @@ class AppDemoHandler(BaseHandler):
             )
         except ValueError as e:
             return self._error_response(str(e), status=401)
+        return self._json_response(result)
+
+    async def handle_send_sms_code(self, request):
+        payload = await self._read_json(request)
+        purpose = str(payload.get("purpose", "login")).strip() or "login"
+        verification = None
+        try:
+            verification = create_sms_verification_request(
+                self.config,
+                phone=str(payload.get("phone", "")).strip(),
+                purpose=purpose,
+                request_ip=request.remote,
+            )
+            provider_request_id = await self.sms_sender.send_verification_code(
+                verification["phone"], verification["code"]
+            )
+            mark_sms_verification_sent(
+                self.config, verification["request_id"], provider_request_id
+            )
+        except SMSRateLimitError as error:
+            return self._json_response(
+                {
+                    "error": str(error),
+                    "retry_after_seconds": error.retry_after_seconds,
+                },
+                status=429,
+            )
+        except SMSConfigurationError as error:
+            if verification:
+                mark_sms_verification_failed(self.config, verification["request_id"])
+            self.logger.bind(tag=TAG).warning(f"短信服务配置不可用: {error}")
+            return self._error_response("短信服务暂未配置，请使用密码登录", status=503)
+        except SMSProviderError as error:
+            if verification:
+                mark_sms_verification_failed(self.config, verification["request_id"])
+            self.logger.bind(tag=TAG).warning(f"阿里云短信发送失败: code={error.code}")
+            return self._error_response(error.public_message, status=502)
+        except ValueError as error:
+            if verification:
+                mark_sms_verification_failed(self.config, verification["request_id"])
+            return self._error_response(str(error), status=400)
+
+        return self._json_response(
+            {
+                "masked_phone": verification["phone"][:3]
+                + "****"
+                + verification["phone"][-4:],
+                "expires_in_seconds": verification["expires_in_seconds"],
+                "retry_after_seconds": verification["retry_after_seconds"],
+            }
+        )
+
+    async def handle_verify_sms_code(self, request):
+        payload = await self._read_json(request)
+        try:
+            result = verify_sms_code_and_login(
+                self.config,
+                phone=str(payload.get("phone", "")).strip(),
+                code=str(payload.get("code", "")).strip(),
+                nickname=str(payload.get("nickname", "")).strip(),
+                purpose=str(payload.get("purpose", "login")).strip() or "login",
+            )
+        except ValueError as error:
+            return self._error_response(str(error), status=400)
         return self._json_response(result)
 
     async def _handle_invite_auth(self, request):
@@ -357,7 +439,32 @@ class AppDemoHandler(BaseHandler):
                 if not value:
                     return self._error_response(f"{field} 不能为空", status=400)
                 values[field] = value
+        hardware_limits = {
+            "speaker_volume": (0, 100),
+            "screen_brightness": (10, 100),
+        }
+        for field, (minimum, maximum) in hardware_limits.items():
+            if field not in payload:
+                continue
+            value = payload[field]
+            if isinstance(value, bool):
+                return self._error_response(f"{field} 必须是 {minimum} 到 {maximum} 的整数", status=400)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return self._error_response(f"{field} 必须是 {minimum} 到 {maximum} 的整数", status=400)
+            if value < minimum or value > maximum:
+                return self._error_response(f"{field} 必须是 {minimum} 到 {maximum} 的整数", status=400)
+            values[field] = value
         settings = update_settings(self.config, user["id"], device_or_response["id"], values)
+        hardware_values = {
+            field: values[field]
+            for field in hardware_limits
+            if field in values
+        }
+        if hardware_values:
+            sync_result = await self.hardware_settings_applier(device_or_response, hardware_values)
+            settings.update(sync_result)
         return self._json_response(settings)
 
     async def handle_memories(self, request):
@@ -534,6 +641,43 @@ class AppDemoHandler(BaseHandler):
                 "device_online": True,
                 "message": "已通知白泽重启并检查 OTA 升级",
                 "ota": ota,
+            }
+        )
+
+    async def handle_eye_assets_upgrade(self, request):
+        """Ask an online device to check and apply an eye-animation package only."""
+        _user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+
+        conn = self._find_active_connection(device_or_response)
+        if conn is None:
+            return self._json_response(
+                {
+                    "requested": False,
+                    "device_online": False,
+                    "message": "白泽当前不在线，开机联网后会自动检查动画资源",
+                }
+            )
+        try:
+            await conn.websocket.send(
+                json.dumps(
+                    {
+                        "type": "system",
+                        "command": "check_ota",
+                        "reason": "eye_assets_upgrade_requested",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"发送动画资源更新指令失败: {e}")
+            return self._error_response("发送动画资源更新指令失败", status=502)
+        return self._json_response(
+            {
+                "requested": True,
+                "device_online": True,
+                "message": "已通知白泽检查动画资源；校验通过后会自动切换新表情",
             }
         )
 
@@ -720,7 +864,52 @@ class AppDemoHandler(BaseHandler):
         )
         if not device:
             return
+        if event_type == "registered":
+            # MCP may still be initializing here. The device MCP handler repeats the
+            # same replay after it becomes ready; this early attempt handles already
+            # initialized reconnections without waiting for the next event.
+            desired = configured_hardware_settings(self.config, device["id"])
+            if desired:
+                await self._apply_hardware_settings(device, desired)
         await self._broadcast_device_event(device["id"], self._device_event(device, "device.status.updated"))
+
+    async def _apply_hardware_settings(self, device: Dict[str, Any], values: Dict[str, int]) -> Dict[str, str]:
+        conn = self._find_active_connection(device)
+        if conn is None:
+            return {
+                "device_sync_status": "pending",
+                "device_sync_message": "白泽当前不在线，设置会在下次连接后同步",
+            }
+        mcp_client = getattr(conn, "mcp_client", None)
+        if mcp_client is None:
+            return {
+                "device_sync_status": "pending",
+                "device_sync_message": "白泽正在建立控制连接，设置会自动重试",
+            }
+        tool_mapping = {
+            "speaker_volume": ("self_audio_speaker_set_volume", "volume"),
+            "screen_brightness": ("self_screen_set_brightness", "brightness"),
+        }
+        try:
+            for setting_key, value in values.items():
+                tool_name, argument_name = tool_mapping[setting_key]
+                await call_mcp_tool(
+                    conn,
+                    mcp_client,
+                    tool_name,
+                    {argument_name: value},
+                    timeout=5,
+                )
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"设备设置待同步: {e}")
+            return {
+                "device_sync_status": "pending",
+                "device_sync_message": "设置已保存，白泽连接稳定后会自动同步",
+            }
+        return {
+            "device_sync_status": "applied",
+            "device_sync_message": "已同步到白泽",
+        }
 
     def _device_event(self, device: Dict[str, Any], event_type: str) -> Dict[str, Any]:
         return {

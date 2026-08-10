@@ -31,12 +31,13 @@ logger_module.setup_logging = lambda: _NoopLogger()
 sys.modules.setdefault("config.logger", logger_module)
 sys.modules.setdefault("opuslib_next", types.ModuleType("opuslib_next"))
 
-from core.api.app_demo_store import load_state
+from core.api.app_demo_store import DEMO_USER_ID, bind_device, create_device, load_state, update_settings
 from core.providers.tools.device_mcp.mcp_handler import (
     MCPClient,
     _extract_activity_status,
     _extract_battery_percent,
     _refresh_device_status_report,
+    _replay_saved_hardware_settings,
     handle_mcp_message,
 )
 
@@ -160,6 +161,56 @@ class DeviceMCPHandlerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(device["client_id"], "client-mcp-001")
             self.assertEqual(device["model"], "zhengchen_eye")
             self.assertEqual(device["firmware_version"], "1.8.5")
+
+    async def test_replays_settings_saved_while_device_was_offline_after_mcp_ready(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = str(Path(temp_dir) / "state.json")
+            conn = _FakeConnection(state_path)
+            device = create_device(
+                conn.config,
+                source_device_id=conn.device_id,
+                client_id=conn.headers["client-id"],
+            )
+            bind_device(conn.config, DEMO_USER_ID, device["device_code"])
+            update_settings(
+                conn.config,
+                DEMO_USER_ID,
+                device["id"],
+                {"speaker_volume": 55, "screen_brightness": 65},
+            )
+
+            mcp_client = MCPClient()
+            await mcp_client.set_ready(True)
+            for tool_name in (
+                "self_audio_speaker_set_volume",
+                "self_screen_set_brightness",
+            ):
+                await mcp_client.add_tool(
+                    {
+                        "name": tool_name,
+                        "description": "settings",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                )
+
+            calls = []
+
+            async def fake_call_tool(_conn, _client, tool_name, args, timeout):
+                calls.append((tool_name, args, timeout))
+
+            with patch(
+                "core.providers.tools.device_mcp.mcp_handler.call_mcp_tool",
+                new=fake_call_tool,
+            ):
+                await _replay_saved_hardware_settings(conn, mcp_client)
+
+            self.assertCountEqual(
+                calls,
+                [
+                    ("self_audio_speaker_set_volume", {"volume": 55}, 5),
+                    ("self_screen_set_brightness", {"brightness": 65}, 5),
+                ],
+            )
 
 
 if __name__ == "__main__":

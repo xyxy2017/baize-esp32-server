@@ -100,3 +100,29 @@ TTS:
 
 app_demo:
   state_path: data/app_demo_state.json
+
+app_mvp:
+  spirit_power:
+    # Recommended MVP economy: 36 full-power turns and 2 turns recovered per hour.
+    max: 180
+    initial: 180
+    recovery_per_hour: 10
+    conversation_cost: 5
+    spirit_dew_amount: 30
+  sms:
+    # Keep disabled until a dedicated RAM AccessKey is configured in the environment.
+    enabled: false
+    provider: aliyun
+    endpoint: dysmsapi.aliyuncs.com
+    # AccessKey values are read from ALIBABA_CLOUD_ACCESS_KEY_ID and
+    # ALIBABA_CLOUD_ACCESS_KEY_SECRET by default. Do not write them here.
+    # Approved Alibaba Cloud template: 白泽验证码
+    # 白泽的验证码为：${code}，请勿泄露于他人！
+    sign_name: 燃力猫文化
+    template_code: SMS_510440112
+    code_parameter: code
+    code_ttl_seconds: 300
+    resend_interval_seconds: 60
+    max_per_phone_hour: 5
+    max_per_phone_day: 10
+    max_per_ip_hour: 30

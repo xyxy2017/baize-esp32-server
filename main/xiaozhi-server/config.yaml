@@ -228,7 +228,8 @@ end_prompt:
   enable: true # 是否开启结束语
   # 结束语
   prompt: |
-    请你以"时间过得真快"未来头，用富有感情、依依不舍的话来结束这场对话吧！
+    请从下面的短句中随机选一句作为白泽幼灵的告别，只输出所选短句，不要解释、扩写或使用固定开头：
+    “下次见呀！”“白泽先歇会儿。”“回头再聊呀！”“我等你回来。”“晚点见啦！”
 
 # 具体处理时选择的模块(The module selected for specific processing)
 selected_module:

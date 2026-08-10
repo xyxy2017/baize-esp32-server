@@ -62,6 +62,65 @@ class SpiritPowerRuleTest(unittest.TestCase):
         self.assertEqual(spirit_power_cost_for_seconds(60), 5)
         self.assertEqual(spirit_power_cost_for_seconds(61), 10)
 
+    def test_spirit_power_economy_loads_from_config(self):
+        from core.api.app_demo_store import (
+            product_day_key,
+            spirit_power_conversation_cost,
+            spirit_power_cost_for_seconds,
+            user_summary,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "configured-spirit.sqlite3")
+            default_config = {"app_mvp": {"db_path": db_path}}
+            self.assertEqual(
+                user_summary(default_config, "demo_user")["spirit_power"]["current"],
+                120,
+            )
+
+            config = {
+                "app_mvp": {
+                    "db_path": db_path,
+                    "spirit_power": {
+                        "max": 180,
+                        "initial": 180,
+                        "recovery_per_hour": 10,
+                        "conversation_cost": 5,
+                        "spirit_dew_amount": 30,
+                    },
+                }
+            }
+            configured = user_summary(config, "demo_user")["spirit_power"]
+            self.assertEqual(configured["current"], 180)
+            self.assertEqual(configured["max"], 180)
+            self.assertEqual(configured["recovery_per_hour"], 10)
+            self.assertEqual(configured["conversation_cost"], 5)
+            self.assertEqual(configured["spirit_dew_amount"], 30)
+            self.assertEqual(spirit_power_conversation_cost(config), 5)
+            self.assertEqual(spirit_power_cost_for_seconds(61, config), 10)
+
+            two_hours_ago = (
+                datetime.now(timezone.utc) - timedelta(hours=2, minutes=1)
+            ).replace(microsecond=0).isoformat()
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    UPDATE energy_accounts
+                    SET current_energy = 100, last_recovered_on = ?,
+                        last_hourly_recovered_at = ?
+                    WHERE user_id = 'demo_user'
+                    """,
+                    (product_day_key(), two_hours_ago),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(
+                user_summary(config, "demo_user")["spirit_power"]["current"],
+                120,
+            )
+
     def test_hourly_recovery_and_daily_refill(self):
         from core.api.app_demo_store import product_day_key, user_summary
 
@@ -90,6 +149,53 @@ class SpiritPowerRuleTest(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(user_summary(config, "demo_user")["spirit_power"]["current"], 120)
+
+    def test_physical_device_allows_only_one_account_binding(self):
+        from core.api.app_demo_store import (
+            DEMO_DEVICE_ID,
+            ensure_db,
+            resolve_bound_app_device,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "bindings.sqlite3")
+            config = {"app_mvp": {"db_path": db_path}}
+            ensure_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "UPDATE devices SET source_device_id = ?, client_id = ? WHERE id = ?",
+                    ("68:ee:8f:5c:71:54", "latest-client", DEMO_DEVICE_ID),
+                )
+                bound_at = "2026-08-09T00:00:00+00:00"
+                conn.execute(
+                    """
+                    INSERT INTO users(id, nickname, login_type, invite_code, created_at, last_login_at)
+                    VALUES ('another_user', 'another_user', 'test', '', ?, ?)
+                    """,
+                    (bound_at, bound_at),
+                )
+                conn.execute(
+                    "INSERT INTO user_device_bindings(user_id, device_id, bound_at) VALUES ('demo_user', ?, ?)",
+                    (DEMO_DEVICE_ID, bound_at),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(
+                        "INSERT INTO user_device_bindings(user_id, device_id, bound_at) VALUES (?, ?, ?)",
+                        ("another_user", DEMO_DEVICE_ID, bound_at),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            resolved = resolve_bound_app_device(
+                config,
+                source_device_id="68:ee:8f:5c:71:54",
+                client_id="latest-client",
+            )
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved["user_id"], "demo_user")
 
 
 class AppDemoHandlerTest(AioHTTPTestCase):
@@ -150,6 +256,14 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         }
         self.refreshed_connections = []
         self.demo_runs = []
+        self.sent_sms_codes = []
+
+        class _FakeSMSSender:
+            async def send_verification_code(inner_self, phone, code):
+                self.sent_sms_codes.append({"phone": phone, "code": code})
+                return f"aliyun-request-{len(self.sent_sms_codes)}"
+
+        self.sms_sender = _FakeSMSSender()
 
         class _FakeRegistry:
             def __init__(inner_self):
@@ -210,6 +324,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             device_registry=self.registry,
             mcp_status_refresher=fake_status_refresher,
             demo_runner=fake_demo_runner,
+            sms_sender=self.sms_sender,
         )
         self.handler = handler
         health_handler = HealthHandler(self.config)
@@ -255,6 +370,203 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(await list_response.json(), {"items": []})
 
     @unittest_run_loop
+    async def test_sms_code_registers_new_user_and_code_is_one_time(self):
+        send_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138005", "purpose": "login"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(send_response.status, 200)
+        send_payload = await send_response.json()
+        self.assertEqual(send_payload["masked_phone"], "138****8005")
+        self.assertEqual(send_payload["expires_in_seconds"], 300)
+        self.assertEqual(send_payload["retry_after_seconds"], 60)
+        self.assertEqual(len(self.sent_sms_codes), 1)
+
+        code = self.sent_sms_codes[-1]["code"]
+        self.assertRegex(code, r"^\d{6}$")
+        verify_response = await self.client.post(
+            "/api/app/auth/sms/verify",
+            data=json.dumps(
+                {
+                    "phone": "13800138005",
+                    "code": code,
+                    "nickname": "验证码用户",
+                    "purpose": "login",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(verify_response.status, 200)
+        verify_payload = await verify_response.json()
+        self.assertTrue(verify_payload["is_new_user"])
+        self.assertEqual(verify_payload["user"]["nickname"], "验证码用户")
+        self.assertEqual(verify_payload["user"]["login_type"], "phone_sms")
+        self.assertTrue(verify_payload["token"].startswith("mvp_"))
+
+        reused_response = await self.client.post(
+            "/api/app/auth/sms/verify",
+            data=json.dumps({"phone": "13800138005", "code": code}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(reused_response.status, 400)
+        self.assertEqual(
+            (await reused_response.json())["error"], "验证码无效或已过期"
+        )
+
+    @unittest_run_loop
+    async def test_sms_send_enforces_resend_interval_without_calling_provider(self):
+        first_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138006"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(first_response.status, 200)
+
+        second_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138006"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(second_response.status, 429)
+        second_payload = await second_response.json()
+        self.assertGreaterEqual(second_payload["retry_after_seconds"], 1)
+        self.assertEqual(len(self.sent_sms_codes), 1)
+
+    @unittest_run_loop
+    async def test_sms_send_rejects_invalid_phone(self):
+        response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "10086"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"], "phone 格式不正确")
+
+    @unittest_run_loop
+    async def test_sms_send_maps_configuration_and_provider_failures(self):
+        from core.api.sms_sender import SMSConfigurationError, SMSProviderError
+
+        class _UnavailableSender:
+            async def send_verification_code(inner_self, phone, code):
+                raise SMSConfigurationError("missing config")
+
+        self.handler.sms_sender = _UnavailableSender()
+        unavailable_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138015"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(unavailable_response.status, 503)
+        unavailable_payload = await unavailable_response.json()
+        self.assertNotIn("missing config", unavailable_payload["error"])
+
+        class _ProviderFailureSender:
+            async def send_verification_code(inner_self, phone, code):
+                raise SMSProviderError("isv.BUSINESS_LIMIT_CONTROL", "短信发送过于频繁，请稍后再试")
+
+        self.handler.sms_sender = _ProviderFailureSender()
+        provider_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138016"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(provider_response.status, 502)
+        provider_payload = await provider_response.json()
+        self.assertEqual(provider_payload["error"], "短信发送过于频繁，请稍后再试")
+        self.assertNotIn("BUSINESS_LIMIT_CONTROL", provider_payload["error"])
+
+    @unittest_run_loop
+    async def test_sms_code_locks_after_five_wrong_attempts(self):
+        send_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138007"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(send_response.status, 200)
+        correct_code = self.sent_sms_codes[-1]["code"]
+        wrong_code = "000000" if correct_code != "000000" else "111111"
+
+        for _ in range(5):
+            response = await self.client.post(
+                "/api/app/auth/sms/verify",
+                data=json.dumps({"phone": "13800138007", "code": wrong_code}),
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(response.status, 400)
+
+        locked_response = await self.client.post(
+            "/api/app/auth/sms/verify",
+            data=json.dumps({"phone": "13800138007", "code": correct_code}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(locked_response.status, 400)
+
+    @unittest_run_loop
+    async def test_sms_code_expiry_and_existing_user_login(self):
+        register_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps(
+                {
+                    "phone": "13800138008",
+                    "password": "secret1",
+                    "nickname": "已有用户",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(register_response.status, 200)
+        existing_user_id = (await register_response.json())["user"]["id"]
+
+        send_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138008"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(send_response.status, 200)
+        code = self.sent_sms_codes[-1]["code"]
+        verify_response = await self.client.post(
+            "/api/app/auth/sms/verify",
+            data=json.dumps({"phone": "13800138008", "code": code}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(verify_response.status, 200)
+        payload = await verify_response.json()
+        self.assertFalse(payload["is_new_user"])
+        self.assertEqual(payload["user"]["id"], existing_user_id)
+
+        expired_phone = "13800138009"
+        expired_send = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": expired_phone}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(expired_send.status, 200)
+        expired_code = self.sent_sms_codes[-1]["code"]
+
+        from core.api.app_demo_store import app_mvp_db_path_from_config
+
+        conn = sqlite3.connect(app_mvp_db_path_from_config(self.config))
+        try:
+            conn.execute(
+                """
+                UPDATE sms_verification_requests
+                SET expires_at = '2000-01-01T00:00:00+00:00'
+                WHERE phone = ?
+                """,
+                (expired_phone,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        expired_verify = await self.client.post(
+            "/api/app/auth/sms/verify",
+            data=json.dumps({"phone": expired_phone, "code": expired_code}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(expired_verify.status, 400)
+
+    @unittest_run_loop
     async def test_bind_device_and_fetch_demo_pages(self):
         bind_response = await self.client.post(
             "/api/app/devices/bind",
@@ -271,6 +583,8 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(settings_response.status, 200)
         settings = await settings_response.json()
         self.assertEqual(settings["baize_nickname"], "白泽")
+        self.assertEqual(settings["speaker_volume"], 100)
+        self.assertEqual(settings["screen_brightness"], 100)
 
         update_response = await self.client.put(
             f"/api/app/devices/{device_id}/settings",
@@ -324,6 +638,46 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             f"/api/app/devices/{device_id}", headers=self.auth_headers()
         )
         self.assertEqual(after_unbind_response.status, 404)
+
+    @unittest_run_loop
+    async def test_hardware_settings_are_persisted_and_sent_to_device(self):
+        device = await self.bind_demo_device()
+        calls = []
+
+        async def fake_hardware_settings_applier(bound_device, values):
+            calls.append({"device": bound_device["id"], "values": values})
+            return {
+                "device_sync_status": "applied",
+                "device_sync_message": "已同步到白泽",
+            }
+
+        self.handler.hardware_settings_applier = fake_hardware_settings_applier
+        response = await self.client.put(
+            f"/api/app/devices/{device['id']}/settings",
+            data=json.dumps({"speaker_volume": 42, "screen_brightness": 68}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["speaker_volume"], 42)
+        self.assertEqual(payload["screen_brightness"], 68)
+        self.assertEqual(payload["device_sync_status"], "applied")
+        self.assertEqual(calls, [{"device": device["id"], "values": {"speaker_volume": 42, "screen_brightness": 68}}])
+
+        persisted = await self.client.get(
+            f"/api/app/devices/{device['id']}/settings", headers=self.auth_headers()
+        )
+        self.assertEqual((await persisted.json())["speaker_volume"], 42)
+
+    @unittest_run_loop
+    async def test_hardware_settings_validate_ranges(self):
+        device = await self.bind_demo_device()
+        response = await self.client.put(
+            f"/api/app/devices/{device['id']}/settings",
+            data=json.dumps({"screen_brightness": 9}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status, 400)
 
     @unittest_run_loop
     async def test_requires_authorization(self):
@@ -1250,7 +1604,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(ota["release_note"], "设备当前版本 1.2.3")
 
     @unittest_run_loop
-    async def test_demo_auto_binds_first_online_device_to_all_existing_ios_accounts(self):
+    async def test_legacy_demo_flag_does_not_share_device_between_accounts(self):
         from core.api.app_demo_store import update_device_report
 
         self.config["app_mvp"]["demo_auto_bind_new_devices_to_all_users"] = True
@@ -1279,6 +1633,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             battery_percent=88,
         )
 
+        visibility = {}
         for token in (DEMO_TOKEN, alice_token, bob_token):
             list_response = await self.client.get(
                 "/api/app/devices",
@@ -1286,16 +1641,17 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             )
             self.assertEqual(list_response.status, 200)
             payload = await list_response.json()
-            self.assertTrue(any(item["id"] == created["id"] for item in payload["items"]))
+            visibility[token] = any(item["id"] == created["id"] for item in payload["items"])
+
+        self.assertFalse(visibility[DEMO_TOKEN])
+        self.assertFalse(visibility[alice_token])
+        self.assertFalse(visibility[bob_token])
 
         detail_response = await self.client.get(
             f"/api/app/devices/{created['id']}",
             headers={"Authorization": f"Bearer {bob_token}"},
         )
-        self.assertEqual(detail_response.status, 200)
-        detail = await detail_response.json()
-        self.assertEqual(detail["source_device_id"], "68:ee:8f:5c:71:55")
-        self.assertEqual(detail["battery_percent"], 88)
+        self.assertEqual(detail_response.status, 404)
 
     @unittest_run_loop
     async def test_ota_activation_code_binds_current_app_user(self):
@@ -1548,6 +1904,30 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(len(conn.websocket.sent), 1)
         self.assertEqual(json.loads(conn.websocket.sent[0])["type"], "system")
         self.assertEqual(json.loads(conn.websocket.sent[0])["command"], "reboot")
+
+    @unittest_run_loop
+    async def test_eye_assets_upgrade_sends_check_ota_to_online_device(self):
+        from core.api.app_demo_store import update_device_report
+
+        created = update_device_report(
+            self.config,
+            source_device_id="68:ee:8f:5c:71:54",
+            client_id="client-assets-001",
+            model="zhengchen_eye",
+            firmware_version="1.8.11",
+        )
+        conn = self.fake_connection_class("68:ee:8f:5c:71:54", "client-assets-001")
+        self.registry.connections["68:ee:8f:5c:71:54"] = conn
+        self.registry.connections["client-assets-001"] = conn
+
+        response = await self.client.post(
+            f"/api/app/devices/{created['id']}/eye-assets/upgrade",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue((await response.json())["requested"])
+        self.assertEqual(json.loads(conn.websocket.sent[0])["command"], "check_ota")
 
     @unittest_run_loop
     async def test_app_ota_upgrade_reports_offline_device_without_error(self):
