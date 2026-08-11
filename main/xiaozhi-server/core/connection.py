@@ -52,6 +52,11 @@ from core.api.app_demo_store import (
     spirit_power_conversation_cost,
     user_summary,
 )
+from core.api.app_memory_store import (
+    handle_memory_command,
+    memory_v2_enabled,
+    retrieve_memory_context,
+)
 from core.voice_dialogue_gate import enqueue_spirit_power_notice
 
 
@@ -167,6 +172,11 @@ class ConnectionHandler:
         self.asr_audio_queue = queue.Queue()
         self.current_speaker = None  # 存储当前说话人
         self.latest_emotion = "neutral"
+        self.pet_emotion_fallback = "neutral"
+        self.current_memory_retrieval = None
+        self.memory_turn_opt_out = False
+        self.pending_app_dialogue = None
+        self.tts_successful_sentence_id = None
         self.current_metrics = None
 
         # llm相关变量
@@ -304,7 +314,7 @@ class ConnectionHandler:
                 threading.Thread(target=generate_title_task, daemon=True).start()
 
             # 守护线程2：走老流程记忆保存（仅记忆，不含标题）
-            if self.memory:
+            if self.memory and not self._uses_app_memory_v2():
                 # 使用线程池异步保存记忆
                 def save_memory_task():
                     try:
@@ -931,10 +941,17 @@ class ConnectionHandler:
         current_sentence_id = None
 
         if query is not None:
-            self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
+            self.logger.bind(
+                tag=TAG,
+                session_id=self.session_id,
+                user_text_chars=len(query),
+            ).info("llm_user_message_received")
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
+            # 新一轮会话会使上一轮未完成的 TTS 失效，同时丢弃待提交记录。
+            self.pending_app_dialogue = None
+            self.tts_successful_sentence_id = None
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             if self.current_metrics is None:
@@ -991,8 +1008,44 @@ class ConnectionHandler:
         try:
             # 使用带记忆的对话
             memory_str = None
-            # 仅当query非空（代表用户询问）时查询记忆
-            if self.memory is not None and query:
+            # 已绑定 App 设备使用按用户/关系隔离的 Memory V2；其他设备保留旧 Provider。
+            app_device = self._resolve_app_device() if query else None
+            if depth == 0:
+                self.current_memory_retrieval = None
+                self.memory_turn_opt_out = False
+                self.pet_emotion_fallback = "neutral"
+            if app_device and memory_v2_enabled(self.common_config, app_device["id"]):
+                if depth == 0:
+                    memory_control = handle_memory_command(
+                        self.common_config,
+                        app_device["user_id"],
+                        app_device["id"],
+                        query,
+                    )
+                    retrieval = retrieve_memory_context(
+                        self.common_config,
+                        app_device["user_id"],
+                        app_device["id"],
+                        query,
+                        session_id=self.session_id,
+                    )
+                    if memory_control.get("prompt_notice"):
+                        retrieval = dict(retrieval)
+                        retrieval["context"] = (
+                            f"{(retrieval.get('context') or '').rstrip()}"
+                            f"\n<memory_operation>{memory_control['prompt_notice']}"
+                            "</memory_operation>"
+                        ).lstrip()
+                    self.current_memory_retrieval = retrieval
+                    self.memory_turn_opt_out = bool(memory_control.get("opt_out"))
+                    self.pet_emotion_fallback = retrieval.get(
+                        "emotion_fallback", "neutral"
+                    )
+                else:
+                    retrieval = self.current_memory_retrieval or {}
+                memory_str = retrieval.get("context") or None
+            # 仅当 query 非空时查询旧记忆。
+            elif self.memory is not None and query:
                 if depth == 0 and self.current_metrics:
                     self.current_metrics.mark("memory_start")
                 future = asyncio.run_coroutine_threadsafe(
@@ -1029,7 +1082,11 @@ class ConnectionHandler:
                 self.current_metrics.mark("llm_error", error=type(e).__name__)
                 self.logger.bind(tag=TAG).info(self.current_metrics.format_summary())
                 self.current_metrics = None
-            self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            self.logger.bind(
+                tag=TAG,
+                session_id=self.session_id,
+                error_type=type(e).__name__,
+            ).error("llm_request_failed")
             return None
 
         # 处理流式响应
@@ -1089,7 +1146,10 @@ class ConnectionHandler:
                 # 在 llm 回复开头获取情绪。流式首片段可能很短，所以先攒一小段再判定。
                 if emotion_flag and content is not None and content.strip():
                     emotion_text_buffer += content
-                    selected_emotion = textUtils.select_baize_emotion(emotion_text_buffer)
+                    selected_emotion = textUtils.select_baize_emotion(
+                        emotion_text_buffer,
+                        fallback=getattr(self, "pet_emotion_fallback", "neutral"),
+                    )
                     plain_emotion_text = textUtils.check_emoji(emotion_text_buffer).strip()
                     has_explicit_emotion = selected_emotion["emotion"] != "neutral"
                     has_enough_context = len(plain_emotion_text) >= 12 or any(
@@ -1224,7 +1284,7 @@ class ConnectionHandler:
                             for tc in direct_answer_calls
                         )
                         if depth == 0 and app_dialogue_text:
-                            self._append_app_dialogue(query, app_dialogue_text)
+                            self._stage_app_dialogue(query, app_dialogue_text)
                         if depth == 0:
                             if self.current_metrics:
                                 self.current_metrics.set_answer(app_dialogue_text)
@@ -1311,7 +1371,11 @@ class ConnectionHandler:
             self.dialogue.put(Message(role="assistant", content=text_buff))
 
         if depth == 0:
-            self._append_app_dialogue(query, assistant_text)
+            if not assistant_text and hasattr(self.tts, "get_tts_text"):
+                assistant_text = clean_baize_text(
+                    self.tts.get_tts_text(current_sentence_id) or ""
+                )
+            self._stage_app_dialogue(query, assistant_text)
             if self.current_metrics:
                 self.current_metrics.set_answer(assistant_text)
                 self.current_metrics.mark("llm_done", assistant_len=len(assistant_text))
@@ -1327,28 +1391,81 @@ class ConnectionHandler:
 
         return True
 
-    def _append_app_dialogue(self, user_text, assistant_text):
+    def _stage_app_dialogue(self, user_text, assistant_text):
         try:
+            user_text = (user_text or "").strip()
+            assistant_text = clean_baize_text(assistant_text or "")
+            if not user_text or not assistant_text:
+                self.pending_app_dialogue = None
+                return False
             app_device = self._resolve_app_device()
             if not app_device:
-                return
+                self.pending_app_dialogue = None
+                return False
+            self.pending_app_dialogue = {
+                "sentence_id": self.sentence_id,
+                "source_device_id": self.device_id or "",
+                "session_id": self.session_id,
+                "user_text": user_text,
+                "assistant_text": assistant_text,
+                "emotion": getattr(self, "latest_emotion", "neutral") or "neutral",
+                "user_id": app_device["user_id"],
+                "device_id": app_device["id"],
+                "memory_opt_out": bool(self.memory_turn_opt_out),
+                "memory_retrieval": self.current_memory_retrieval,
+            }
+            return True
+        except Exception as e:
+            self.pending_app_dialogue = None
+            self.logger.bind(tag=TAG).error(
+                f"暂存 App 对话记录失败: {type(e).__name__}"
+            )
+            return False
+
+    def _complete_staged_app_dialogue(self, sentence_id, tts_succeeded):
+        pending = self.pending_app_dialogue
+        if not pending or pending.get("sentence_id") != sentence_id:
+            return False
+        self.pending_app_dialogue = None
+        self.current_memory_retrieval = None
+        self.memory_turn_opt_out = False
+        if not tts_succeeded:
+            self.logger.bind(tag=TAG).warning(
+                "TTS 未成功发送音频，跳过 App 对话和记忆持久化"
+            )
+            return False
+        try:
             cost = spirit_power_conversation_cost(self.common_config)
-            if not consume_energy(self.common_config, app_device["user_id"], app_device["id"], cost, "voice_dialogue"):
-                self.logger.bind(tag=TAG).warning("App user spirit power is not enough; skip dialogue persistence")
-                return
+            if not consume_energy(
+                self.common_config,
+                pending["user_id"],
+                pending["device_id"],
+                cost,
+                "voice_dialogue",
+            ):
+                self.logger.bind(tag=TAG).warning(
+                    "App user spirit power is not enough; skip dialogue persistence"
+                )
+                return False
             append_dialogue(
                 self.common_config,
-                source_device_id=self.device_id or "",
-                session_id=self.session_id,
-                user_text=user_text or "",
-                baize_text=assistant_text or "",
-                emotion=getattr(self, "latest_emotion", "neutral") or "neutral",
-                user_id=app_device["user_id"],
-                device_id=app_device["id"],
+                source_device_id=pending["source_device_id"],
+                session_id=pending["session_id"],
+                user_text=pending["user_text"],
+                baize_text=pending["assistant_text"],
+                emotion=pending["emotion"],
+                user_id=pending["user_id"],
+                device_id=pending["device_id"],
                 source="voice",
+                memory_opt_out=pending["memory_opt_out"],
+                memory_retrieval=pending["memory_retrieval"],
             )
+            return True
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"写入 App 对话记录失败: {e}")
+            self.logger.bind(tag=TAG).error(
+                f"写入 App 对话记录失败: {type(e).__name__}"
+            )
+            return False
 
     def _resolve_app_device(self):
         source_device_id = self.device_id or ""
@@ -1361,6 +1478,16 @@ class ConnectionHandler:
             client_id=client_id,
             device_id=source_device_id,
         )
+
+    def _uses_app_memory_v2(self) -> bool:
+        try:
+            app_device = self._resolve_app_device()
+            return bool(
+                app_device
+                and memory_v2_enabled(self.common_config, app_device["id"])
+            )
+        except Exception:
+            return False
 
     def _app_has_energy_for_voice_dialogue(self) -> bool:
         app_device = self._resolve_app_device()

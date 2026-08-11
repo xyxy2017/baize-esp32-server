@@ -129,7 +129,9 @@ def is_punctuation_or_emoji(char):
 
 async def get_emotion(conn: "ConnectionHandler", text):
     """获取文本内的情绪消息"""
-    selected = select_baize_emotion(text)
+    selected = select_baize_emotion(
+        text, fallback=getattr(conn, "pet_emotion_fallback", "neutral")
+    )
     emoji = selected["emoji"]
     emotion = selected["emotion"]
     conn.latest_emotion = emotion

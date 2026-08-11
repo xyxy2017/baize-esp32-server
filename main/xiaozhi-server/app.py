@@ -62,6 +62,11 @@ async def main():
     
     config["server"]["auth_key"] = auth_key
 
+    from core.memory_worker import MemoryWorker
+
+    memory_worker = MemoryWorker(config)
+    await memory_worker.start()
+
     # 添加 stdin 监控任务
     stdin_task = asyncio.create_task(monitor_stdin())
 
@@ -129,6 +134,7 @@ async def main():
     except asyncio.CancelledError:
         print("任务被取消，清理资源中...")
     finally:
+        await memory_worker.stop()
         # 停止全局GC管理器
         await gc_manager.stop()
 

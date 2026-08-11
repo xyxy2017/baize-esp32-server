@@ -102,6 +102,27 @@ app_demo:
   state_path: data/app_demo_state.json
 
 app_mvp:
+  memory_v2:
+    # Keep disabled globally until privacy copy and account controls are ready.
+    enabled: false
+    device_allowlist: []
+    min_confidence: 0.75
+    retrieval_top_k: 5
+    pinned_limit: 5
+    context_max_chars: 1500
+    worker_concurrency: 1
+    worker_max_attempts: 3
+    worker_poll_seconds: 2
+    proactive_enabled: true
+    proactive_daily_limit: 1
+    growth_enabled: true
+    semantic:
+      enabled: false
+      provider: openai_compatible
+      base_url: ""
+      api_key_env: ""
+      model: text-embedding-3-small
+      timeout_seconds: 5
   diary_auto_generation:
     # Generate after the companion has been quiet for 30 minutes at bedtime.
     enabled: true

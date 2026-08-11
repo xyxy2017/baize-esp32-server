@@ -29,7 +29,7 @@ from core.api.app_demo_store import (
     list_diaries,
     list_energy_events,
     list_intimacy_events,
-    list_memories,
+    list_memories_page,
     list_spirit_power_items,
     login_phone_user,
     mark_sms_verification_failed,
@@ -42,7 +42,6 @@ from core.api.app_demo_store import (
     unbind_device,
     update_device_name,
     update_user_password,
-    upsert_memory,
     update_settings,
     user_for_token,
     user_summary,
@@ -51,6 +50,18 @@ from core.api.app_demo_store import (
     spirit_power_summary,
     use_spirit_dew,
     verify_sms_code_and_login,
+)
+from core.api.app_memory_store import (
+    create_memory as create_memory_item,
+    enqueue_rebuild_jobs,
+    forget_memories,
+    handle_memory_command,
+    list_memory_jobs,
+    memory_feedback,
+    memory_summary,
+    memory_v2_enabled,
+    retrieve_memory_context,
+    update_memory as update_memory_item,
 )
 from core.api.base_handler import BaseHandler
 from core.api.sms_sender import (
@@ -111,6 +122,8 @@ class AppDemoHandler(BaseHandler):
             web.get("/api/app/admin/devices", self.handle_admin_devices),
             web.post("/api/app/admin/devices", self.handle_admin_create_device),
             web.post("/api/app/admin/devices/{device_id}/rotate-code", self.handle_admin_rotate_device_code),
+            web.post("/api/app/admin/memory/rebuild", self.handle_admin_memory_rebuild),
+            web.get("/api/app/admin/memory/jobs", self.handle_admin_memory_jobs),
             web.get("/api/app/devices", self.handle_devices),
             web.post("/api/app/devices/bind", self.handle_bind_device),
             web.get("/api/app/devices/{device_id}", self.handle_device_detail),
@@ -119,8 +132,11 @@ class AppDemoHandler(BaseHandler):
             web.put("/api/app/devices/{device_id}/settings", self.handle_update_settings),
             web.get("/api/app/devices/{device_id}/memories", self.handle_memories),
             web.post("/api/app/devices/{device_id}/memories", self.handle_create_memory),
+            web.post("/api/app/devices/{device_id}/memories/forget", self.handle_forget_memories),
             web.put("/api/app/devices/{device_id}/memories/{memory_id}", self.handle_update_memory),
             web.delete("/api/app/devices/{device_id}/memories/{memory_id}", self.handle_delete_memory),
+            web.post("/api/app/devices/{device_id}/memories/{memory_id}/feedback", self.handle_memory_feedback),
+            web.get("/api/app/devices/{device_id}/memory-summary", self.handle_memory_summary),
             web.post("/api/app/devices/{device_id}/debug/chat", self.handle_debug_chat),
             web.get("/api/app/devices/{device_id}/connection", self.handle_connection_diagnostic),
             web.get("/api/app/devices/{device_id}/events", self.handle_device_events),
@@ -380,11 +396,44 @@ class AppDemoHandler(BaseHandler):
             return self._error_response("设备不存在", status=404)
         return self._json_response(device)
 
+    async def handle_admin_memory_rebuild(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        payload = await self._read_json(request)
+        enqueued = enqueue_rebuild_jobs(
+            self.config,
+            user_id=str(payload.get("user_id", "")).strip() or None,
+            device_id=str(payload.get("device_id", "")).strip() or None,
+        )
+        return self._json_response({"enqueued": enqueued})
+
+    async def handle_admin_memory_jobs(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        try:
+            items = list_memory_jobs(
+                self.config,
+                status=str(request.query.get("status", "")).strip() or None,
+                limit=self._limit(request),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        return self._json_response({"items": items})
+
     async def handle_devices(self, request):
         user = self._current_user(request)
         if not user:
             return self._error_response("未登录或 token 无效", status=401)
-        return self._json_response({"items": [self._device_payload(item) for item in list_devices(self.config, user["id"])]})
+        return self._json_response(
+            {
+                "items": [
+                    self._device_payload(item, user["id"])
+                    for item in list_devices(self.config, user["id"])
+                ]
+            }
+        )
 
     async def handle_bind_device(self, request):
         user = self._current_user(request)
@@ -400,13 +449,13 @@ class AppDemoHandler(BaseHandler):
             return self._error_response(str(e), status=409)
         if not device:
             return self._error_response("设备码不存在", status=404)
-        return self._json_response(self._device_payload(device))
+        return self._json_response(self._device_payload(device, user["id"]))
 
     async def handle_device_detail(self, request):
         user, device_or_response = self._get_bound_device_or_response(request)
         if isinstance(device_or_response, web.Response):
             return device_or_response
-        return self._json_response(self._device_payload(device_or_response))
+        return self._json_response(self._device_payload(device_or_response, user["id"]))
 
     async def handle_update_device(self, request):
         user = self._current_user(request)
@@ -471,7 +520,35 @@ class AppDemoHandler(BaseHandler):
         user, device_or_response = self._get_bound_device_or_response(request)
         if isinstance(device_or_response, web.Response):
             return device_or_response
-        return self._json_response({"items": list_memories(self.config, user["id"], device_or_response["id"]) or []})
+        pinned = None
+        if "pinned" in request.query:
+            pinned = str(request.query.get("pinned", "")).lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+        try:
+            page = list_memories_page(
+                self.config,
+                user["id"],
+                device_or_response["id"],
+                scope=str(request.query.get("scope", "")).strip() or None,
+                memory_type=str(
+                    request.query.get("type", request.query.get("category", ""))
+                ).strip()
+                or None,
+                pinned=pinned,
+                status=str(request.query.get("status", "active")).strip()
+                or "active",
+                limit=self._limit(request),
+                cursor=str(request.query.get("cursor", "")).strip() or None,
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        payload = {"items": (page or {}).get("items", [])}
+        if page and page.get("next_cursor"):
+            payload["next_cursor"] = page["next_cursor"]
+        return self._json_response(payload)
 
     async def handle_create_memory(self, request):
         user, device_or_response = self._get_bound_device_or_response(request)
@@ -479,12 +556,20 @@ class AppDemoHandler(BaseHandler):
             return device_or_response
         payload = await self._read_json(request)
         try:
-            memory = upsert_memory(
+            memory = create_memory_item(
                 self.config,
                 user["id"],
                 device_or_response["id"],
-                str(payload.get("category", "note")).strip(),
-                str(payload.get("content", "")).strip(),
+                content=str(payload.get("content", "")).strip(),
+                memory_type=str(
+                    payload.get("type", payload.get("category", "note"))
+                ).strip(),
+                scope=str(payload.get("scope", "relationship")).strip(),
+                key=str(payload.get("key", "")).strip() or None,
+                importance=payload.get("importance", 70),
+                pinned=bool(payload.get("pinned", False)),
+                expires_at=payload.get("expires_at"),
+                occurred_at=payload.get("occurred_at"),
             )
         except ValueError as e:
             return self._error_response(str(e), status=400)
@@ -498,13 +583,12 @@ class AppDemoHandler(BaseHandler):
             return device_or_response
         payload = await self._read_json(request)
         try:
-            memory = upsert_memory(
+            memory = update_memory_item(
                 self.config,
                 user["id"],
                 device_or_response["id"],
-                str(payload.get("category", "note")).strip(),
-                str(payload.get("content", "")).strip(),
-                memory_id=request.match_info["memory_id"],
+                request.match_info["memory_id"],
+                payload,
             )
         except ValueError as e:
             return self._error_response(str(e), status=400)
@@ -526,6 +610,51 @@ class AppDemoHandler(BaseHandler):
             return self._error_response("记忆不存在", status=404)
         return self._json_response({"deleted": True, "id": request.match_info["memory_id"]})
 
+    async def handle_forget_memories(self, request):
+        user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+        payload = await self._read_json(request)
+        try:
+            result = forget_memories(
+                self.config,
+                user["id"],
+                device_or_response["id"],
+                str(payload.get("query", "")).strip(),
+                scope=str(payload.get("scope", "")).strip() or None,
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        return self._json_response(result or {"matched": False, "deleted": []})
+
+    async def handle_memory_feedback(self, request):
+        user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+        payload = await self._read_json(request)
+        try:
+            result = memory_feedback(
+                self.config,
+                user["id"],
+                device_or_response["id"],
+                request.match_info["memory_id"],
+                str(payload.get("result", "")).strip(),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not result:
+            return self._error_response("记忆不存在", status=404)
+        return self._json_response(result)
+
+    async def handle_memory_summary(self, request):
+        user, device_or_response = self._get_bound_device_or_response(request)
+        if isinstance(device_or_response, web.Response):
+            return device_or_response
+        result = memory_summary(
+            self.config, user["id"], device_or_response["id"]
+        )
+        return self._json_response(result or {})
+
     async def handle_debug_chat(self, request):
         user, device_or_response = self._get_bound_device_or_response(request)
         if isinstance(device_or_response, web.Response):
@@ -539,15 +668,37 @@ class AppDemoHandler(BaseHandler):
         if not user_text:
             return self._error_response("text 不能为空", status=400)
         try:
+            memory_control = {"handled": False, "opt_out": False}
+            retrieval = None
+            if memory_v2_enabled(self.config, device["id"]):
+                memory_control = handle_memory_command(
+                    self.config, user["id"], device["id"], user_text
+                )
+                retrieval = retrieve_memory_context(
+                    self.config,
+                    user["id"],
+                    device["id"],
+                    user_text,
+                    session_id="debug",
+                )
             system_prompt = self._build_debug_prompt(device["id"])
             if not system_prompt:
                 return self._error_response("未配置白泽 prompt", status=503)
+            if retrieval and retrieval.get("context"):
+                system_prompt = f"{system_prompt.rstrip()}\n{retrieval['context']}"
+            if memory_control.get("prompt_notice"):
+                system_prompt = (
+                    f"{system_prompt.rstrip()}\n<memory_operation>"
+                    f"{memory_control['prompt_notice']}</memory_operation>"
+                )
             reply = str(self._get_demo_llm().response_no_stream(system_prompt, user_text)).strip()
             reply = clean_baize_text(reply)
             if not reply:
                 return self._error_response("LLM 未返回内容", status=502)
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"Debug Chat 调用失败: {e}")
+            self.logger.bind(tag=TAG, error_type=type(e).__name__).error(
+                "debug_chat_failed"
+            )
             return self._error_response("Debug Chat 调用失败", status=500)
 
         session_id = f"demo_chat_{uuid.uuid4().hex}"
@@ -563,8 +714,18 @@ class AppDemoHandler(BaseHandler):
             user_id=user["id"],
             device_id=device["id"],
             source="debug",
+            memory_opt_out=bool(memory_control.get("opt_out")),
+            memory_retrieval=retrieval,
         )
-        return self._json_response({"reply": reply, "session_id": session_id, "dialogue": dialogue})
+        return self._json_response(
+            {
+                "reply": reply,
+                "session_id": session_id,
+                "dialogue": dialogue,
+                "memory_action": memory_control.get("action"),
+                "memory_error": memory_control.get("error"),
+            }
+        )
 
     async def handle_dialogues(self, request):
         user, device_or_response = self._get_bound_device_or_response(request)
@@ -811,7 +972,9 @@ class AppDemoHandler(BaseHandler):
             return user, self._error_response("设备不存在或未绑定", status=404)
         return user, device
 
-    def _device_payload(self, device: Dict[str, Any]) -> Dict[str, Any]:
+    def _device_payload(
+        self, device: Dict[str, Any], user_id: str | None = None
+    ) -> Dict[str, Any]:
         fields = (
             "id",
             "device_code",
@@ -831,6 +994,14 @@ class AppDemoHandler(BaseHandler):
             payload["online_status"] = "online" if conn is not None else "offline"
             if conn is not None and getattr(conn, "activity_status", None):
                 payload["activity_status"] = getattr(conn, "activity_status")
+        if user_id:
+            summary = memory_summary(self.config, user_id, device["id"])
+            if summary:
+                payload["memory"] = {
+                    "active_count": summary["total"],
+                    "pending_jobs": summary["pending_jobs"],
+                }
+                payload["growth"] = summary["growth"]
         return payload
 
     def _has_real_device_identity(self, device: Dict[str, Any]) -> bool:

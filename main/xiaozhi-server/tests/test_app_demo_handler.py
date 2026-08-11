@@ -351,7 +351,6 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             "app_mvp": {
                 "admin_phones": ["13800138001"],
                 "firmware_bin_dir": self.bin_dir,
-                "demo_auto_bind_new_devices_to_all_users": True,
             },
             "firmware_cache_ttl": 30,
             "prompt": "你是白泽幼灵，来自上古神话世界，是神兽白泽的幼年形态。你默认称呼用户为小伙伴，也可以偶尔使用朋友或伙伴，不使用主人称呼。",
@@ -1037,6 +1036,142 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertGreaterEqual(len((await intimacy_response.json())["items"]), 1)
 
     @unittest_run_loop
+    async def test_memory_v2_commands_filters_feedback_summary_and_admin_jobs(self):
+        self.config["app_mvp"]["memory_v2"] = {
+            "enabled": True,
+            "min_confidence": 0.75,
+            "retrieval_top_k": 5,
+            "pinned_limit": 5,
+            "context_max_chars": 1500,
+        }
+        await self.bind_demo_device()
+
+        chat_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/debug/chat",
+            data=json.dumps({"text": "请记住我喜欢桂花"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(chat_response.status, 200)
+        self.assertEqual((await chat_response.json())["memory_action"], "remember")
+        self.assertIn(
+            "<memory_context>", self.llm_instances[0].calls[0]["system_prompt"]
+        )
+        self.assertIn(
+            "我喜欢桂花", self.llm_instances[0].calls[0]["system_prompt"]
+        )
+
+        rejected_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/debug/chat",
+            data=json.dumps({"text": "请记住我的验证码是 123456"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(rejected_response.status, 200)
+        rejected_payload = await rejected_response.json()
+        self.assertEqual(rejected_payload["memory_action"], "rejected")
+        self.assertEqual(rejected_payload["memory_error"], "sensitive_content")
+        self.assertIn(
+            "禁止保存的敏感信息",
+            self.llm_instances[0].calls[1]["system_prompt"],
+        )
+
+        list_response = await self.client.get(
+            "/api/app/devices/baize_dev_001/memories?scope=user&type=preference&pinned=true&limit=1",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(list_response.status, 200)
+        memory = (await list_response.json())["items"][0]
+        self.assertEqual(memory["scope"], "user")
+        self.assertEqual(memory["type"], "preference")
+        self.assertTrue(memory["pinned"])
+
+        me_response = await self.client.get("/api/app/me", headers=self.auth_headers())
+        self.assertGreaterEqual((await me_response.json())["memory"]["active_count"], 1)
+        detail_response = await self.client.get(
+            "/api/app/devices/baize_dev_001", headers=self.auth_headers()
+        )
+        detail = await detail_response.json()
+        self.assertGreaterEqual(detail["memory"]["active_count"], 1)
+        self.assertEqual(detail["growth"]["activity"], 50)
+
+        invalid_filter_response = await self.client.get(
+            "/api/app/devices/baize_dev_001/memories?status=invalid",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(invalid_filter_response.status, 400)
+
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        update_response = await self.client.put(
+            f"/api/app/devices/baize_dev_001/memories/{memory['id']}",
+            data=json.dumps(
+                {"content": "我最喜欢桂花", "expires_at": expires_at}
+            ),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(update_response.status, 200)
+        updated = await update_response.json()
+        self.assertEqual(updated["confidence"], 1.0)
+        self.assertEqual(updated["content"], "我最喜欢桂花")
+
+        feedback_response = await self.client.post(
+            f"/api/app/devices/baize_dev_001/memories/{memory['id']}/feedback",
+            data=json.dumps({"result": "correct"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(feedback_response.status, 200)
+        self.assertEqual(
+            (await feedback_response.json())["memory"]["confirmation_count"], 2
+        )
+
+        summary_response = await self.client.get(
+            "/api/app/devices/baize_dev_001/memory-summary",
+            headers=self.auth_headers(),
+        )
+        summary = await summary_response.json()
+        self.assertGreaterEqual(summary["total"], 1)
+        self.assertEqual(summary["growth"]["activity"], 50)
+
+        forget_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/memories/forget",
+            data=json.dumps({"query": "我最喜欢桂花"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(forget_response.status, 200)
+        self.assertTrue((await forget_response.json())["matched"])
+
+        forbidden_jobs = await self.client.get(
+            "/api/app/admin/memory/jobs", headers=self.auth_headers()
+        )
+        self.assertEqual(forbidden_jobs.status, 403)
+        admin_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps(
+                {
+                    "phone": "13800138001",
+                    "password": "secret1",
+                    "nickname": "Admin",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        admin_token = (await admin_response.json())["token"]
+        admin_headers = {
+            "Authorization": f"Bearer {admin_token}",
+            "Content-Type": "application/json",
+        }
+        rebuild_response = await self.client.post(
+            "/api/app/admin/memory/rebuild",
+            data=json.dumps({"device_id": "baize_dev_001"}),
+            headers=admin_headers,
+        )
+        self.assertEqual(rebuild_response.status, 200)
+        self.assertGreaterEqual((await rebuild_response.json())["enqueued"], 1)
+        jobs_response = await self.client.get(
+            "/api/app/admin/memory/jobs?status=pending", headers=admin_headers
+        )
+        self.assertEqual(jobs_response.status, 200)
+        self.assertGreaterEqual(len((await jobs_response.json())["items"]), 1)
+
+    @unittest_run_loop
     async def test_device_detail_marks_stale_online_state_offline_without_active_connection(self):
         from core.api.app_demo_store import update_device_report
 
@@ -1247,7 +1382,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(payload["items"][0]["source_device_id"], "68:ee:8f:5c:71:54")
 
     @unittest_run_loop
-    async def test_demo_bound_users_can_read_shared_real_device_dialogues(self):
+    async def test_bound_user_cannot_read_another_users_device_dialogues(self):
         from core.api.app_demo_store import append_dialogue
 
         await self.client.post(
@@ -1272,8 +1407,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
 
         self.assertEqual(response.status, 200)
         payload = await response.json()
-        self.assertEqual(payload["items"][0]["user_text"], "我前面有跟你聊过天吗？")
-        self.assertEqual(payload["items"][0]["source_device_id"], "68:ee:8f:5c:71:54")
+        self.assertEqual(payload["items"], [])
 
     @unittest_run_loop
     async def test_dialogues_infer_emotion_from_baize_emoji_prefix(self):
@@ -1956,6 +2090,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
     async def test_app_ota_payload_scans_uploaded_firmware_without_device_ota_check(self):
         from core.api.app_demo_store import update_device_report
 
+        await self.bind_demo_device()
         Path(self.bin_dir).mkdir(parents=True, exist_ok=True)
         Path(self.bin_dir, "zhengchen_eye_1.8.7.bin").write_bytes(b"demo firmware")
         created = update_device_report(
@@ -1980,6 +2115,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
     async def test_app_ota_upgrade_sends_reboot_command_to_online_device(self):
         from core.api.app_demo_store import update_device_report
 
+        await self.bind_demo_device()
         Path(self.bin_dir).mkdir(parents=True, exist_ok=True)
         Path(self.bin_dir, "zhengchen_eye_1.8.7.bin").write_bytes(b"demo firmware")
         created = update_device_report(
@@ -2012,6 +2148,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
     async def test_eye_assets_upgrade_sends_check_ota_to_online_device(self):
         from core.api.app_demo_store import update_device_report
 
+        await self.bind_demo_device()
         created = update_device_report(
             self.config,
             source_device_id="68:ee:8f:5c:71:54",
@@ -2036,6 +2173,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
     async def test_app_ota_upgrade_reports_offline_device_without_error(self):
         from core.api.app_demo_store import update_device_report
 
+        await self.bind_demo_device()
         Path(self.bin_dir).mkdir(parents=True, exist_ok=True)
         Path(self.bin_dir, "zhengchen_eye_1.8.7.bin").write_bytes(b"demo firmware")
         created = update_device_report(

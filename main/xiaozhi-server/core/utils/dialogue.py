@@ -135,12 +135,28 @@ class Dialogue:
 
             # 填充记忆
             if memory_str is not None:
-                dynamic_part = re.sub(
-                    r"<memory>.*?</memory>",
-                    f"<memory>\n{memory_str}\n</memory>",
-                    dynamic_part,
-                    flags=re.DOTALL,
-                )
+                if memory_str.lstrip().startswith("<memory_context>"):
+                    dynamic_part, replacements = re.subn(
+                        r"<memory>.*?</memory>",
+                        memory_str,
+                        dynamic_part,
+                        flags=re.DOTALL,
+                    )
+                else:
+                    wrapped_memory = f"<memory>\n{memory_str}\n</memory>"
+                    dynamic_part, replacements = re.subn(
+                        r"<memory>.*?</memory>",
+                        wrapped_memory,
+                        dynamic_part,
+                        flags=re.DOTALL,
+                    )
+                if replacements == 0:
+                    memory_context = (
+                        memory_str
+                        if memory_str.lstrip().startswith("<memory_context>")
+                        else wrapped_memory
+                    )
+                    dynamic_part = f"{dynamic_part.rstrip()}\n{memory_context}"
 
             # 追加说话人信息
             try:
@@ -163,6 +179,13 @@ class Dialogue:
                 pass
 
             dialogue.append({"role": "system", "content": dynamic_part})
+        elif system_message and memory_str is not None:
+            memory_context = (
+                memory_str
+                if memory_str.lstrip().startswith("<memory_context>")
+                else f"<memory>\n{memory_str}\n</memory>"
+            )
+            dialogue.append({"role": "system", "content": memory_context})
 
         # 第四段：实际对话历史（不含 few-shot）
         actual_messages = [m for m in non_system_messages if not m.is_temporary]

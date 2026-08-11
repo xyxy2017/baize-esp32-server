@@ -485,6 +485,9 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_schema(conn)
+    from core.api.app_memory_store import ensure_memory_v2_schema
+
+    ensure_memory_v2_schema(conn)
     conn.commit()
 
 
@@ -1542,6 +1545,9 @@ def bind_device(config: dict, user_id: str, device_code: str) -> Dict[str, Any] 
             "INSERT OR IGNORE INTO user_device_bindings(user_id, device_id, bound_at) VALUES (?, ?, ?)",
             (user_id, row["id"], now_iso()),
         )
+        from core.api.app_memory_store import activate_relationship_conn
+
+        activate_relationship_conn(conn, user_id, row["id"])
         _ensure_intimacy(conn, user_id, row["id"])
         conn.commit()
         return device_payload(row)
@@ -1656,10 +1662,20 @@ def unbind_device(config: dict, user_id: str, device_id: str) -> bool:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
+        from core.api.app_memory_store import archive_relationship_conn
+
+        if not _is_bound_conn(conn, user_id, device_id):
+            return False
+        archive_relationship_conn(conn, user_id, device_id)
         cur = conn.execute(
             "DELETE FROM user_device_bindings WHERE user_id = ? AND device_id = ?",
             (user_id, device_id),
         )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE device_settings SET user_call_name = '小伙伴' WHERE device_id = ?",
+                (device_id,),
+            )
         conn.commit()
         return cur.rowcount > 0
 
@@ -1909,6 +1925,8 @@ def append_dialogue(
     user_id: str | None = None,
     device_id: str | None = None,
     source: str = "voice",
+    memory_opt_out: bool = False,
+    memory_retrieval: dict | None = None,
 ) -> Dict[str, Any]:
     user_text = (user_text or "").strip()
     inferred_emotion = infer_emotion(baize_text, emotion or "neutral")
@@ -1948,9 +1966,26 @@ def append_dialogue(
             "INSERT INTO emotion_stats(id, user_id, device_id, emotion, source, created_at) VALUES (?, ?, ?, ?, 'dialogue', ?)",
             (f"emotion_{uuid.uuid4().hex}", user_id, device_id, inferred_emotion, created_at),
         )
+        if user_id and device_id:
+            from core.api.app_memory_store import record_dialogue_memory_conn
+
+            record_dialogue_memory_conn(
+                conn,
+                config,
+                user_id=user_id,
+                device_id=device_id,
+                dialogue_id=item["id"],
+                user_text=user_text,
+                opt_out=memory_opt_out,
+            )
         conn.commit()
     record_dialogue_intimacy(config, user_id, device_id)
-    extract_memories_from_dialogue(config, user_id, device_id, user_text, baize_text)
+    if user_id and device_id and memory_retrieval:
+        from core.api.app_memory_store import mark_memory_context_used
+
+        mark_memory_context_used(
+            config, user_id, device_id, item["id"], memory_retrieval
+        )
     from core.telemetry import dialogue_persisted
 
     dialogue_persisted(source, inferred_emotion)
@@ -2477,20 +2512,18 @@ def list_diaries(config: dict, user_id: str, device_id: str) -> list[Dict[str, A
 
 
 def list_memories(config: dict, user_id: str, device_id: str) -> list[Dict[str, Any]] | None:
-    db_path = app_mvp_db_path_from_config(config)
-    ensure_db(db_path)
-    with _connect(db_path) as conn:
-        if not _is_bound_conn(conn, user_id, device_id):
-            return None
-        rows = conn.execute(
-            """
-            SELECT id, category, content, created_at FROM memories
-            WHERE user_id = ? AND device_id = ? AND disabled_at IS NULL
-            ORDER BY created_at DESC
-            """,
-            (user_id, device_id),
-        ).fetchall()
-        return [dict(row) for row in rows]
+    from core.api.app_memory_store import list_memories as list_memory_items
+
+    page = list_memory_items(config, user_id, device_id)
+    return None if page is None else page["items"]
+
+
+def list_memories_page(
+    config: dict, user_id: str, device_id: str, **filters
+) -> Dict[str, Any] | None:
+    from core.api.app_memory_store import list_memories as list_memory_items
+
+    return list_memory_items(config, user_id, device_id, **filters)
 
 
 def upsert_memory(
@@ -2500,49 +2533,29 @@ def upsert_memory(
     category: str,
     content: str,
     memory_id: str | None = None,
+    **values,
 ) -> Dict[str, Any] | None:
-    category = (category or "note").strip()
-    content = (content or "").strip()
-    if not content:
-        raise ValueError("content 不能为空")
-    if category not in {"preference", "nickname", "event", "emotion", "note"}:
-        category = "note"
-    db_path = app_mvp_db_path_from_config(config)
-    ensure_db(db_path)
-    with _connect(db_path) as conn:
-        if not _is_bound_conn(conn, user_id, device_id):
-            return None
-        now = now_iso()
-        if memory_id:
-            cur = conn.execute(
-                """
-                UPDATE memories SET category = ?, content = ?
-                WHERE id = ? AND user_id = ? AND device_id = ? AND disabled_at IS NULL
-                """,
-                (category, content, memory_id, user_id, device_id),
-            )
-            if cur.rowcount == 0:
-                return None
-        else:
-            duplicate = conn.execute(
-                """
-                SELECT id FROM memories
-                WHERE user_id = ? AND device_id = ? AND category = ? AND content = ? AND disabled_at IS NULL
-                """,
-                (user_id, device_id, category, content),
-            ).fetchone()
-            memory_id = duplicate["id"] if duplicate else f"mem_{uuid.uuid4().hex}"
-            if duplicate is None:
-                conn.execute(
-                    "INSERT INTO memories(id, user_id, device_id, category, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (memory_id, user_id, device_id, category, content, now),
-                )
-        conn.commit()
-        row = conn.execute(
-            "SELECT id, category, content, created_at FROM memories WHERE id = ?",
-            (memory_id,),
-        ).fetchone()
-        return dict(row) if row else None
+    from core.api.app_memory_store import create_memory, update_memory
+
+    if memory_id:
+        update_values = dict(values)
+        update_values.update({"category": category, "content": content})
+        return update_memory(
+            config, user_id, device_id, memory_id, update_values
+        )
+    return create_memory(
+        config,
+        user_id,
+        device_id,
+        content=content,
+        memory_type=category,
+        scope=values.get("scope", "relationship"),
+        key=values.get("key"),
+        importance=values.get("importance", 70),
+        pinned=values.get("pinned", False),
+        expires_at=values.get("expires_at"),
+        occurred_at=values.get("occurred_at"),
+    )
 
 
 def extract_memories_from_dialogue(
@@ -2577,20 +2590,9 @@ def extract_memories_from_dialogue(
 
 
 def delete_memory(config: dict, user_id: str, device_id: str, memory_id: str) -> bool | None:
-    db_path = app_mvp_db_path_from_config(config)
-    ensure_db(db_path)
-    with _connect(db_path) as conn:
-        if not _is_bound_conn(conn, user_id, device_id):
-            return None
-        cur = conn.execute(
-            """
-            UPDATE memories SET disabled_at = ?
-            WHERE user_id = ? AND device_id = ? AND id = ? AND disabled_at IS NULL
-            """,
-            (now_iso(), user_id, device_id, memory_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
+    from core.api.app_memory_store import delete_memory as delete_memory_item
+
+    return delete_memory_item(config, user_id, device_id, memory_id)
 
 
 def user_summary(config: dict, user_id: str) -> Dict[str, Any]:
@@ -2602,12 +2604,16 @@ def user_summary(config: dict, user_id: str) -> Dict[str, Any]:
         if not user_row:
             return {}
         spirit_power = _spirit_power_payload(conn, user_id, config)
-        return {
+        payload = {
             **_row_to_user(user_row),
             "spirit_power": spirit_power,
             "energy": spirit_power,
             "intimacy": intimacy_payload(conn, user_id),
         }
+    from core.api.app_memory_store import user_memory_overview
+
+    payload["memory"] = user_memory_overview(config, user_id)
+    return payload
 
 
 def ota_payload(config: dict, user_id: str, device_id: str) -> Dict[str, Any] | None:
@@ -2823,7 +2829,7 @@ def admin_metrics(config: dict) -> Dict[str, Any]:
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
     with _connect(db_path) as conn:
-        return {
+        payload = {
             "users": conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"],
             "bound_devices": conn.execute("SELECT COUNT(*) AS c FROM user_device_bindings").fetchone()["c"],
             "dialogues": conn.execute("SELECT COUNT(*) AS c FROM dialogues").fetchone()["c"],
@@ -2835,6 +2841,10 @@ def admin_metrics(config: dict) -> Dict[str, Any]:
             },
             "phone_users": conn.execute("SELECT COUNT(*) AS c FROM users WHERE phone IS NOT NULL AND phone != ''").fetchone()["c"],
         }
+    from core.api.app_memory_store import memory_metrics_snapshot
+
+    payload.update(memory_metrics_snapshot(config))
+    return payload
 
 
 def prompt_context_for_device(config: dict, device_identifier: str) -> str:

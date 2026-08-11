@@ -262,6 +262,8 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
         # 直接发送opus数据包
         await conn.websocket.send(opus_packet)
 
+    conn.tts_successful_sentence_id = flow_control.get("sentence_id")
+
     metrics = getattr(conn, "current_metrics", None)
     if metrics and not metrics.first_audio_sent:
         metrics.first_audio_sent = True
@@ -284,6 +286,7 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
     if text is not None:
         message["text"] = textUtils.check_emoji(text)
 
+    tts_succeeded = False
     # TTS播放结束
     if state == "stop":
         # 保存当前的 sentence_id，用于后续判断是否是当前轮次
@@ -298,6 +301,10 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
             await sendAudio(conn, audios)
         # 等待所有音频包发送完成
         await _wait_for_audio_completion(conn)
+        tts_succeeded = (
+            getattr(conn, "tts_successful_sentence_id", None)
+            == current_sentence_id
+        )
 
         # 检查是否是当前轮次
         if current_sentence_id != conn.sentence_id:
@@ -315,6 +322,12 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
+    if state == "stop" and hasattr(conn, "_complete_staged_app_dialogue"):
+        await asyncio.to_thread(
+            conn._complete_staged_app_dialogue,
+            current_sentence_id,
+            tts_succeeded,
+        )
 
 
 async def send_stt_message(conn: "ConnectionHandler", text):
