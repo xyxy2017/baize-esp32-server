@@ -31,3 +31,33 @@ groups:
         for: 1m
         labels: {severity: warning}
         annotations: {summary: "Baize upstream content guard blocks or errors exceeded 10 in 5 minutes"}
+      - alert: BaizeMobileCrashReported
+        expr: increase(baize_app_crash_reports_total[10m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations: {summary: "A signed-in Baize mobile app reported a crash"}
+      - alert: BaizeMobileApi5xxHigh
+        expr: sum(increase(baize_app_api_reports_total{status_class="5xx"}[10m])) > 5
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "Mobile clients observed more than five API 5xx responses in ten minutes"}
+      - alert: BaizeMobileApiP95Slow
+        expr: histogram_quantile(0.95, sum by (le) (rate(baize_app_api_duration_seconds_bucket[10m]))) > 3
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Mobile-observed API p95 latency exceeds three seconds"}
+      - alert: BaizeSqliteUnhealthy
+        expr: baize_sqlite_healthy == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Baize SQLite health check is failing"}
+      - alert: BaizeMemoryPressure
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Baize server has less than 10% available memory"}
+      - alert: BaizeSupportTicketBacklog
+        expr: baize_open_support_tickets > 10
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: "More than ten support tickets are waiting"}

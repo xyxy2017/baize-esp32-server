@@ -11,6 +11,8 @@ ExecStart=/opt/miniconda/envs/baize/bin/python app.py
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+# Root-owned, mode 0600. Optional during Demo operation; required before SMS is enabled.
+EnvironmentFile=-/etc/baize/app-secrets.env
 StandardOutput=journal
 StandardError=journal
 

@@ -50,6 +50,7 @@ from core.api.app_demo_store import (
     consume_energy,
     resolve_bound_app_device,
     spirit_power_conversation_cost,
+    spirit_power_cost_for_seconds,
     user_summary,
 )
 from core.api.app_memory_store import (
@@ -184,6 +185,7 @@ class ConnectionHandler:
         self.current_memory_retrieval = None
         self.memory_turn_opt_out = False
         self.pending_app_dialogue = None
+        self.current_user_audio_seconds = 0.0
         self.tts_successful_sentence_id = None
         self.current_metrics = None
         self.safety_blocked_turn = False
@@ -1654,7 +1656,11 @@ class ConnectionHandler:
                 "device_id": app_device["id"],
                 "memory_opt_out": bool(self.memory_turn_opt_out),
                 "memory_retrieval": self.current_memory_retrieval,
+                "user_audio_seconds": max(
+                    0.0, float(self.current_user_audio_seconds or 0.0)
+                ),
             }
+            self.current_user_audio_seconds = 0.0
             return True
         except Exception as e:
             self.pending_app_dialogue = None
@@ -1676,7 +1682,9 @@ class ConnectionHandler:
             )
             return False
         try:
-            cost = spirit_power_conversation_cost(self.common_config)
+            cost = spirit_power_cost_for_seconds(
+                pending.get("user_audio_seconds"), self.common_config
+            )
             if not consume_energy(
                 self.common_config,
                 pending["user_id"],
@@ -1700,6 +1708,8 @@ class ConnectionHandler:
                 source="voice",
                 memory_opt_out=pending["memory_opt_out"],
                 memory_retrieval=pending["memory_retrieval"],
+                user_audio_seconds=pending.get("user_audio_seconds", 0.0),
+                spirit_power_cost=cost,
             )
             return True
         except Exception as e:

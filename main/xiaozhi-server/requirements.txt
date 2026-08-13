@@ -32,6 +32,10 @@ cnlunar==0.2.0
 PySocks==1.7.1
 dashscope==1.25.2
 alibabacloud-dysmsapi20170525==4.3.1
+# The Alibaba Cloud Tea SDK currently requires cryptography <49. Keep this
+# pair explicit so fresh installs do not select pyOpenSSL 26.3+ (requires >=49).
+cryptography==46.0.3
+pyOpenSSL==26.0.0
 baidu-aip==4.16.13
 chardet==5.2.0
 aioconsole==0.8.2

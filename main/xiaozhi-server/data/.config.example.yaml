@@ -102,6 +102,15 @@ app_demo:
   state_path: data/app_demo_state.json
 
 app_mvp:
+  auth:
+    # Formal builds bind password accounts to an SMS-verified phone number.
+    registration_verification_required: true
+    # Keep the shared demo identity unavailable on production deployments.
+    demo_login_enabled: false
+    # Optional non-SMS numeric IDs for dedicated store review accounts.
+    # These values are accepted by password login only; keep the list private
+    # in production config and never use a potentially real mobile number.
+    review_login_phones: []
   memory_v2:
     # Keep disabled globally until privacy copy and account controls are ready.
     enabled: false

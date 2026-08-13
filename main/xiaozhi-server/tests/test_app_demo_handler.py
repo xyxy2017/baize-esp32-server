@@ -47,6 +47,7 @@ jwt_module.decode = lambda *_args, **_kwargs: {}
 sys.modules.setdefault("jwt", jwt_module)
 
 from core.api.app_demo_handler import AppDemoHandler, DEMO_TOKEN
+from core.api.app_demo_store import set_dashboard_admin
 from core.api.health_handler import HealthHandler
 from core.api.ota_handler import OTAHandler
 from core.api.vision_handler import VisionHandler
@@ -479,6 +480,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             sms_sender=self.sms_sender,
         )
         self.handler = handler
+        set_dashboard_admin(self.config, "owner_test", "StrongOpsPassword!2026")
         health_handler = HealthHandler(self.config)
         ota_handler = OTAHandler(self.config)
         vision_handler = VisionHandler(self.config)
@@ -567,6 +569,127 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(
             (await reused_response.json())["error"], "验证码无效或已过期"
         )
+
+    @unittest_run_loop
+    async def test_formal_registration_requires_phone_verification(self):
+        self.config.setdefault("app_mvp", {})["auth"] = {
+            "registration_verification_required": True
+        }
+        rejected = await self.client.post(
+            "/api/app/register",
+            data=json.dumps(
+                {
+                    "phone": "13800138025",
+                    "password": "secret1",
+                    "confirm_password": "secret1",
+                    "nickname": "正式用户",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(rejected.status, 400)
+
+        sent = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138025", "purpose": "register"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(sent.status, 200)
+        code = self.sent_sms_codes[-1]["code"]
+        registered = await self.client.post(
+            "/api/app/register",
+            data=json.dumps(
+                {
+                    "phone": "13800138025",
+                    "code": code,
+                    "password": "secret1",
+                    "confirm_password": "secret1",
+                    "nickname": "正式用户",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(registered.status, 200)
+        self.assertEqual((await registered.json())["user"]["phone"], "13800138025")
+
+    @unittest_run_loop
+    async def test_forgot_password_resets_password_and_revokes_existing_tokens(self):
+        registered = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138026", "password": "secret1"}),
+            headers={"Content-Type": "application/json"},
+        )
+        old_token = (await registered.json())["token"]
+        sent = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps(
+                {"phone": "13800138026", "purpose": "reset_password"}
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(sent.status, 200)
+        code = self.sent_sms_codes[-1]["code"]
+        reset = await self.client.post(
+            "/api/app/auth/password/reset",
+            data=json.dumps(
+                {
+                    "phone": "13800138026",
+                    "code": code,
+                    "new_password": "secret2",
+                    "confirm_password": "secret2",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(reset.status, 200)
+        old_session = await self.client.get(
+            "/api/app/me", headers={"Authorization": f"Bearer {old_token}"}
+        )
+        self.assertEqual(old_session.status, 401)
+        logged_in = await self.client.post(
+            "/api/app/login",
+            data=json.dumps({"phone": "13800138026", "password": "secret2"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(logged_in.status, 200)
+
+    @unittest_run_loop
+    async def test_authenticated_app_telemetry_is_sanitized_and_accepted(self):
+        crash = await self.client.post(
+            "/api/app/telemetry/crash",
+            data=json.dumps(
+                {
+                    "platform": "android",
+                    "app_version": "0.2.0",
+                    "error_type": "IllegalStateException",
+                    "message": "test crash",
+                    "details": {"thread": "main"},
+                }
+            ),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(crash.status, 202)
+        api_metric = await self.client.post(
+            "/api/app/telemetry/api",
+            data=json.dumps(
+                {
+                    "platform": "ios",
+                    "app_version": "0.2.0",
+                    "route": "/api/app/me",
+                    "method": "GET",
+                    "status_code": 503,
+                    "duration_ms": 3120.5,
+                }
+            ),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(api_metric.status, 202)
+        unauthenticated = await self.client.post(
+            "/api/app/telemetry/crash",
+            data=json.dumps({"platform": "android"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(unauthenticated.status, 401)
 
     @unittest_run_loop
     async def test_sms_send_enforces_resend_interval_without_calling_provider(self):
@@ -916,6 +1039,7 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(register_payload["user"]["phone"], "13800138000")
         self.assertEqual(register_payload["user"]["nickname"], "138****8000")
         self.assertEqual(register_payload["user"]["role"], "user")
+        self.assertTrue(register_payload["user"]["has_password"])
         token = register_payload["token"]
 
         duplicate_response = await self.client.post(
@@ -960,10 +1084,21 @@ class AppDemoHandlerTest(AioHTTPTestCase):
 
         update_response = await self.client.post(
             "/api/app/me/password",
-            data=json.dumps({"old_password": "secret1", "new_password": "secret2"}),
+            data=json.dumps(
+                {
+                    "old_password": "secret1",
+                    "new_password": "secret2",
+                    "confirm_password": "secret2",
+                }
+            ),
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         )
         self.assertEqual(update_response.status, 200)
+
+        revoked_session = await self.client.get(
+            "/api/app/me", headers={"Authorization": f"Bearer {token}"}
+        )
+        self.assertEqual(revoked_session.status, 401)
 
         old_login_response = await self.client.post(
             "/api/app/login",
@@ -978,6 +1113,116 @@ class AppDemoHandlerTest(AioHTTPTestCase):
             headers={"Content-Type": "application/json"},
         )
         self.assertEqual(new_login_response.status, 200)
+        self.assertTrue((await new_login_response.json())["user"]["has_password"])
+
+    @unittest_run_loop
+    async def test_virtual_review_phone_is_password_login_only(self):
+        from core.api.app_demo_store import (
+            _hash_password,
+            app_mvp_db_path_from_config,
+            now_iso,
+        )
+
+        review_phone = "10000000001"
+        self.config["app_mvp"].setdefault("auth", {})["review_login_phones"] = [
+            review_phone
+        ]
+        now = now_iso()
+        with sqlite3.connect(app_mvp_db_path_from_config(self.config)) as conn:
+            conn.execute(
+                """
+                INSERT INTO users(
+                    id, nickname, login_type, invite_code, phone, password_hash,
+                    password_updated_at, role, created_at, last_login_at
+                ) VALUES (?, ?, 'phone_password', '', ?, ?, ?, 'user', ?, ?)
+                """,
+                (
+                    "review_user",
+                    "山海幼灵体验账号",
+                    review_phone,
+                    _hash_password("ReviewPassword1!"),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+        login_response = await self.client.post(
+            "/api/app/login",
+            data=json.dumps(
+                {"phone": review_phone, "password": "ReviewPassword1!"}
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(login_response.status, 200)
+        self.assertEqual((await login_response.json())["user"]["id"], "review_user")
+
+        register_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps(
+                {"phone": review_phone, "password": "ReviewPassword1!"}
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(register_response.status, 400)
+
+        sms_response = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": review_phone, "purpose": "login"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(sms_response.status, 400)
+
+    @unittest_run_loop
+    async def test_sms_account_can_set_first_password_without_old_password(self):
+        sent = await self.client.post(
+            "/api/app/auth/sms/send",
+            data=json.dumps({"phone": "13800138035", "purpose": "login"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(sent.status, 200)
+        code = self.sent_sms_codes[-1]["code"]
+        verified = await self.client.post(
+            "/api/app/auth/sms/verify",
+            data=json.dumps({"phone": "13800138035", "code": code}),
+            headers={"Content-Type": "application/json"},
+        )
+        verified_payload = await verified.json()
+        token = verified_payload["token"]
+        self.assertFalse(verified_payload["user"]["has_password"])
+
+        mismatch = await self.client.post(
+            "/api/app/me/password",
+            data=json.dumps(
+                {"old_password": "", "new_password": "secret2", "confirm_password": "secret3"}
+            ),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        self.assertEqual(mismatch.status, 400)
+
+        updated = await self.client.post(
+            "/api/app/me/password",
+            data=json.dumps(
+                {"old_password": "", "new_password": "secret2", "confirm_password": "secret2"}
+            ),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        self.assertEqual(updated.status, 200)
+        self.assertTrue((await updated.json())["requires_reauthentication"])
+        self.assertEqual(
+            (await self.client.get(
+                "/api/app/me", headers={"Authorization": f"Bearer {token}"}
+            )).status,
+            401,
+        )
+
+        logged_in = await self.client.post(
+            "/api/app/login",
+            data=json.dumps({"phone": "13800138035", "password": "secret2"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(logged_in.status, 200)
+        self.assertTrue((await logged_in.json())["user"]["has_password"])
 
     @unittest_run_loop
     async def test_admin_device_management_and_unique_device_binding(self):
@@ -1037,6 +1282,146 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         list_response = await self.client.get("/api/app/admin/devices", headers={"Authorization": f"Bearer {alice_token}"})
         self.assertEqual(list_response.status, 200)
         self.assertTrue(any(item["id"] == device["id"] for item in (await list_response.json())["items"]))
+
+        users_response = await self.client.get("/api/app/admin/users", headers={"Authorization": f"Bearer {alice_token}"})
+        self.assertEqual(users_response.status, 200)
+        admin_users = (await users_response.json())["items"]
+        alice = next(item for item in admin_users if item["nickname"] == "Alice")
+        self.assertEqual(alice["masked_phone"], "138****8001")
+        self.assertTrue(alice["has_password"])
+        self.assertEqual(alice["device_count"], 1)
+
+    @unittest_run_loop
+    async def test_account_deletion_removes_user_data_and_revokes_token(self):
+        registered = await self.client.post(
+            "/api/app/register",
+            data=json.dumps({"phone": "13800138033", "password": "secret1", "nickname": "待注销"}),
+            headers={"Content-Type": "application/json"},
+        )
+        payload = await registered.json()
+        token = payload["token"]
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        rejected = await self.client.delete(
+            "/api/app/me", data=json.dumps({"confirmation": "删除"}), headers=headers
+        )
+        self.assertEqual(rejected.status, 400)
+        deleted = await self.client.delete(
+            "/api/app/me", data=json.dumps({"confirmation": "注销账号"}), headers=headers
+        )
+        self.assertEqual(deleted.status, 200)
+        self.assertTrue((await deleted.json())["deleted"])
+        self.assertEqual((await self.client.get("/api/app/me", headers=headers)).status, 401)
+
+    @unittest_run_loop
+    async def test_demo_account_cannot_be_deleted(self):
+        response = await self.client.delete(
+            "/api/app/me",
+            data=json.dumps({"confirmation": "注销账号"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status, 409)
+
+    @unittest_run_loop
+    async def test_public_app_store_pages_are_available(self):
+        for path in ("/support", "/privacy", "/account-deletion", "/status", "/baize-ops/console"):
+            response = await self.client.get(path)
+            self.assertEqual(response.status, 200)
+            self.assertIn("燃力猫文化创意有限公司", await response.text())
+
+    @unittest_run_loop
+    async def test_dashboard_uses_independent_read_only_credentials(self):
+        rejected = await self.client.post(
+            "/api/app/ops/login",
+            data=json.dumps({"username": "owner_test", "password": "wrong-password"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(rejected.status, 401)
+        login = await self.client.post(
+            "/api/app/ops/login",
+            data=json.dumps({"username": "owner_test", "password": "StrongOpsPassword!2026"}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(login.status, 200)
+        token = (await login.json())["token"]
+        summary = await self.client.get(
+            "/api/app/ops/summary", headers={"Authorization": f"Bearer {token}"}
+        )
+        self.assertEqual(summary.status, 200)
+        payload = await summary.json()
+        self.assertIn("metrics", payload)
+        self.assertIn("users", payload)
+        self.assertIn("operations", payload)
+
+    @unittest_run_loop
+    async def test_support_ticket_user_and_operations_flow(self):
+        ticket_response = await self.client.post(
+            "/api/app/support/tickets",
+            data=json.dumps({
+                "category": "account",
+                "subject": "无法修改资料",
+                "message": "我的账号资料无法正常更新，请协助处理。",
+            }),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(ticket_response.status, 201)
+        ticket = await ticket_response.json()
+        self.assertEqual(ticket["status"], "open")
+
+        own_list = await self.client.get(
+            "/api/app/support/tickets", headers=self.auth_headers()
+        )
+        self.assertEqual(own_list.status, 200)
+        self.assertEqual((await own_list.json())["items"][0]["id"], ticket["id"])
+
+        login = await self.client.post(
+            "/api/app/ops/login",
+            data=json.dumps({"username": "owner_test", "password": "StrongOpsPassword!2026"}),
+            headers={"Content-Type": "application/json"},
+        )
+        ops_token = (await login.json())["token"]
+        ops_headers = {"Authorization": f"Bearer {ops_token}", "Content-Type": "application/json"}
+        ops_list = await self.client.get("/api/app/ops/tickets", headers=ops_headers)
+        self.assertEqual(ops_list.status, 200)
+        self.assertEqual((await ops_list.json())["items"][0]["masked_phone"], None)
+
+        updated = await self.client.put(
+            f"/api/app/ops/tickets/{ticket['id']}",
+            data=json.dumps({"status": "resolved", "operator_reply": "已协助处理，请重启 App。"}),
+            headers=ops_headers,
+        )
+        self.assertEqual(updated.status, 200)
+        self.assertEqual((await updated.json())["status"], "resolved")
+        refreshed = await self.client.get("/api/app/support/tickets", headers=self.auth_headers())
+        self.assertEqual((await refreshed.json())["items"][0]["operator_reply"], "已协助处理，请重启 App。")
+
+    @unittest_run_loop
+    async def test_account_export_is_scoped_and_excludes_auth_secrets(self):
+        export_response = await self.client.get(
+            "/api/app/me/export", headers=self.auth_headers()
+        )
+        self.assertEqual(export_response.status, 200)
+        payload = await export_response.json()
+        self.assertEqual(payload["account"]["id"], "demo_user")
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("password_hash", serialized)
+        self.assertNotIn("auth_tokens", serialized)
+        self.assertNotIn("dashboard", serialized)
+
+    @unittest_run_loop
+    async def test_dashboard_login_rate_limits_repeated_failures(self):
+        for _ in range(5):
+            response = await self.client.post(
+                "/api/app/ops/login",
+                data=json.dumps({"username": "owner_test", "password": "wrong-password"}),
+                headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.8"},
+            )
+            self.assertEqual(response.status, 401)
+        limited = await self.client.post(
+            "/api/app/ops/login",
+            data=json.dumps({"username": "owner_test", "password": "wrong-password"}),
+            headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.8"},
+        )
+        self.assertEqual(limited.status, 429)
 
     @unittest_run_loop
     async def test_memory_create_update_and_admin_event_lists(self):

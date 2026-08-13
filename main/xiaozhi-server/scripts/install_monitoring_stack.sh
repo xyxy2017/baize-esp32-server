@@ -31,7 +31,7 @@ cp -a "${VHOST}" "${BACKUP_DIR}/burningpowercat.com"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates certbot curl prometheus prometheus-blackbox-exporter prometheus-node-exporter
+apt-get install -y ca-certificates certbot curl prometheus prometheus-alertmanager prometheus-blackbox-exporter prometheus-node-exporter
 "${PYTHON_BIN}" -m pip install --no-deps 'prometheus-client==0.23.1'
 
 if ! command -v grafana-server >/dev/null 2>&1; then
@@ -40,16 +40,20 @@ if ! command -v grafana-server >/dev/null 2>&1; then
   apt-get install -y "${grafana_deb}"
 fi
 
-install -d -m 0755 /etc/nginx/snippets /etc/prometheus/rules /etc/systemd/system/prometheus.service.d /etc/systemd/system/prometheus-node-exporter.service.d /etc/systemd/system/prometheus-blackbox-exporter.service.d /etc/systemd/system/grafana-server.service.d /etc/baize /var/log/baize
+install -d -m 0755 /etc/nginx/snippets /etc/prometheus/rules /etc/systemd/system/prometheus.service.d /etc/systemd/system/prometheus-alertmanager.service.d /etc/systemd/system/prometheus-node-exporter.service.d /etc/systemd/system/prometheus-blackbox-exporter.service.d /etc/systemd/system/grafana-server.service.d /etc/baize /var/log/baize
 install -m 0644 "${PROJECT_DIR}/deploy/nginx/baize-log-format.conf" /etc/nginx/conf.d/baize-log-format.conf
 install -m 0644 "${PROJECT_DIR}/deploy/nginx/baize-xiaozhi.locations.conf" /etc/nginx/snippets/baize-xiaozhi.locations.conf
 install -m 0644 "${PROJECT_DIR}/deploy/monitoring/prometheus.yml" /etc/prometheus/prometheus.yml
 install -m 0644 "${PROJECT_DIR}/deploy/monitoring/blackbox.yml" /etc/prometheus/blackbox.yml
 install -m 0644 "${PROJECT_DIR}/deploy/monitoring/baize-alerts.yml" /etc/prometheus/rules/baize-alerts.yml
+if [[ ! -f /etc/prometheus/alertmanager.yml ]]; then
+  install -m 0640 "${PROJECT_DIR}/deploy/monitoring/alertmanager.yml.example" /etc/prometheus/alertmanager.yml
+fi
 install -m 0644 "${PROJECT_DIR}/deploy/monitoring/grafana.ini" /etc/grafana/grafana.ini
 install -m 0644 "${PROJECT_DIR}/deploy/monitoring/logrotate-baize-nginx" /etc/logrotate.d/baize-nginx
 install -m 0644 "${PROJECT_DIR}/deploy/systemd/baize-xiaozhi.service" /etc/systemd/system/baize-xiaozhi.service
 chown -R prometheus:prometheus /etc/prometheus/rules /etc/prometheus/blackbox.yml
+chown prometheus:prometheus /etc/prometheus/alertmanager.yml
 chown -R grafana:grafana /var/lib/grafana
 chown www-data:adm /var/log/baize
 
@@ -74,6 +78,11 @@ cat > /etc/systemd/system/prometheus-node-exporter.service.d/baize.conf <<'EOF'
 [Service]
 ExecStart=
 ExecStart=/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:9100 --collector.systemd
+EOF
+cat > /etc/systemd/system/prometheus-alertmanager.service.d/baize.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/prometheus-alertmanager --config.file=/etc/prometheus/alertmanager.yml --storage.path=/var/lib/prometheus/alertmanager --web.listen-address=127.0.0.1:9093
 EOF
 cat > /etc/systemd/system/prometheus-blackbox-exporter.service.d/baize.conf <<'EOF'
 [Service]
@@ -122,8 +131,8 @@ sed -i -E "s|^([[:space:]]*vision_explain:).*|\\1 https://${DOMAIN}/mcp/vision/e
 
 nginx -t
 systemctl daemon-reload
-systemctl enable prometheus prometheus-node-exporter prometheus-blackbox-exporter grafana-server
-systemctl restart prometheus prometheus-node-exporter prometheus-blackbox-exporter grafana-server
+systemctl enable prometheus prometheus-alertmanager prometheus-node-exporter prometheus-blackbox-exporter grafana-server
+systemctl restart prometheus prometheus-alertmanager prometheus-node-exporter prometheus-blackbox-exporter grafana-server
 systemctl restart nginx baize-xiaozhi
 systemctl enable certbot.timer
 if [[ "${SKIP_CERTBOT_DRY_RUN:-0}" != "1" ]]; then

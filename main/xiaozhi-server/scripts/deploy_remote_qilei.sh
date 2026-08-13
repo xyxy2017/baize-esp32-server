@@ -61,6 +61,7 @@ scp \
   core/content_safety.py \
   core/http_server.py \
   core/device_registry.py \
+  core/telemetry.py \
   "${REMOTE_HOST}:${PROJECT_DIR}/core/"
 
 scp \
@@ -91,6 +92,10 @@ scp \
 scp \
   core/providers/llm/openai/openai.py \
   "${REMOTE_HOST}:${PROJECT_DIR}/core/providers/llm/openai/"
+
+scp \
+  core/providers/asr/base.py \
+  "${REMOTE_HOST}:${PROJECT_DIR}/core/providers/asr/"
 
 scp \
   core/providers/tools/device_mcp/mcp_handler.py \
@@ -126,8 +131,10 @@ cd '${PROJECT_DIR}'
   core/api/ota_handler.py \
   core/api/vision_handler.py \
   core/http_server.py \
-  core/device_registry.py \
   core/connection.py \
+  core/telemetry.py \
+  core/providers/asr/base.py \
+  core/device_registry.py \
   core/content_safety.py \
   core/handle/helloHandle.py \
   core/handle/intentHandler.py \
@@ -137,7 +144,6 @@ cd '${PROJECT_DIR}'
   core/handle/textHandler/listenMessageHandler.py \
   core/memory_embedding.py \
   core/memory_worker.py \
-  core/telemetry.py \
   core/utils/conversation_metrics.py \
   core/utils/dialogue.py \
   core/utils/modules_initialize.py \

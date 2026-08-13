@@ -18,6 +18,7 @@ BOUND_DEVICES = Gauge("baize_bound_devices", "Total App MVP device bindings.")
 STORED_DIALOGUES = Gauge("baize_stored_dialogues", "Total persisted App MVP dialogues.")
 STORED_DIARIES = Gauge("baize_stored_diaries", "Total persisted App MVP diaries.")
 STORED_ENERGY_SPENT = Gauge("baize_stored_energy_spent", "Total recorded spirit power consumption.")
+OPEN_SUPPORT_TICKETS = Gauge("baize_open_support_tickets", "Open or in-progress customer support tickets.")
 EMOTION_HITS = Gauge("baize_emotion_hits", "Persisted dialogue emotion counts.", ("emotion",))
 CONTENT_SAFETY_CHECKS = Counter(
     "baize_content_safety_checks_total",
@@ -33,6 +34,21 @@ CONTENT_SAFETY_PROVIDER_ERRORS = Counter(
     "baize_content_safety_provider_errors_total",
     "Content safety provider errors and upstream guard blocks.",
     ("provider",),
+)
+APP_CRASH_REPORTS = Counter(
+    "baize_app_crash_reports_total",
+    "Crash diagnostics uploaded by signed-in mobile apps.",
+    ("platform", "error_type"),
+)
+APP_API_REPORTS = Counter(
+    "baize_app_api_reports_total",
+    "API request observations uploaded by signed-in mobile apps.",
+    ("platform", "route", "status_class"),
+)
+APP_API_DURATION = Histogram(
+    "baize_app_api_duration_seconds",
+    "API latency observed by signed-in mobile apps.",
+    ("platform", "route"),
 )
 
 
@@ -85,6 +101,26 @@ def content_safety_provider_error(provider: str) -> None:
     CONTENT_SAFETY_PROVIDER_ERRORS.labels(provider=provider or "unknown").inc()
 
 
+def app_crash_reported(platform: str, error_type: str) -> None:
+    APP_CRASH_REPORTS.labels(
+        platform=platform or "unknown", error_type=(error_type or "unknown")[:120]
+    ).inc()
+
+
+def app_api_reported(
+    platform: str, route: str, status_code: int | None, duration_ms: float
+) -> None:
+    code = int(status_code or 0)
+    status_class = f"{code // 100}xx" if 100 <= code <= 599 else "error"
+    clean_route = (route or "unknown")[:160]
+    APP_API_REPORTS.labels(
+        platform=platform or "unknown", route=clean_route, status_class=status_class
+    ).inc()
+    APP_API_DURATION.labels(
+        platform=platform or "unknown", route=clean_route
+    ).observe(max(0.0, float(duration_ms or 0)) / 1000.0)
+
+
 def set_sqlite_health(ok: bool) -> None:
     SQLITE_HEALTH.set(1 if ok else 0)
 
@@ -95,6 +131,7 @@ def set_business_snapshot(snapshot: dict) -> None:
     STORED_DIALOGUES.set(snapshot.get("dialogues", 0))
     STORED_DIARIES.set(snapshot.get("diaries", 0))
     STORED_ENERGY_SPENT.set(snapshot.get("energy_consumed", 0))
+    OPEN_SUPPORT_TICKETS.set(snapshot.get("open_tickets", 0))
     for emotion, count in (snapshot.get("emotion_hits") or {}).items():
         EMOTION_HITS.labels(emotion=emotion).set(count)
 

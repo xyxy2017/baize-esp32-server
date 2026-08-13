@@ -84,6 +84,13 @@ class ASRProviderBase(ABC):
     async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes]):
         """并行处理ASR和声纹识别"""
         try:
+            if conn.audio_format == "pcm":
+                audio_seconds = sum(len(frame) for frame in asr_audio_task) / 32000.0
+            else:
+                # ESP32 clients send 60 ms Opus frames; the ASR buffer is the
+                # billable user utterance including its short VAD boundary.
+                audio_seconds = len(asr_audio_task) * 0.06
+            conn.current_user_audio_seconds = max(0.0, audio_seconds)
             total_start_time = time.monotonic()
 
             # 准备音频数据

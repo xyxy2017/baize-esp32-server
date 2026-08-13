@@ -18,12 +18,19 @@ from core.api.app_demo_store import (
     configured_hardware_settings,
     consume_energy,
     check_in_spirit_power,
+    create_support_ticket,
     create_device,
+    delete_user_account,
+    dashboard_admin_for_token,
     delete_memory,
     generate_diary,
     get_settings,
     list_admin_conversations,
     list_admin_devices,
+    list_admin_users,
+    list_ops_support_tickets,
+    list_user_support_tickets,
+    login_dashboard_admin,
     list_devices,
     list_dialogues,
     list_diaries,
@@ -35,16 +42,21 @@ from core.api.app_demo_store import (
     mark_sms_verification_failed,
     mark_sms_verification_sent,
     ota_payload,
+    operations_snapshot,
     register_phone_user,
     register_or_login_user,
+    record_app_telemetry,
+    reset_user_password_with_sms,
     resolve_bound_app_device,
     rotate_device_code,
     unbind_device,
+    update_support_ticket,
     update_device_name,
     update_user_password,
     update_settings,
     user_for_token,
     user_summary,
+    export_user_data,
     create_sms_verification_request,
     SMSRateLimitError,
     spirit_power_summary,
@@ -113,23 +125,41 @@ class AppDemoHandler(BaseHandler):
         self.hardware_settings_applier = hardware_settings_applier or self._apply_hardware_settings
         self.sms_sender = sms_sender or AliyunSMSSender(config)
         self._event_subscribers = {}
+        self._dashboard_login_failures = {}
         if self.device_registry is not None and hasattr(self.device_registry, "subscribe"):
             self.device_registry.subscribe(self._handle_registry_event)
 
     def routes(self):
         return [
+            web.get("/support", self.handle_support_page),
+            web.get("/privacy", self.handle_privacy_page),
+            web.get("/account-deletion", self.handle_account_deletion_page),
+            web.get("/status", self.handle_status_page),
+            web.get("/baize-ops/console", self.handle_dashboard_page),
+            web.post("/api/app/ops/login", self.handle_dashboard_login),
+            web.get("/api/app/ops/summary", self.handle_dashboard_summary),
+            web.get("/api/app/ops/tickets", self.handle_ops_tickets),
+            web.put("/api/app/ops/tickets/{ticket_id}", self.handle_ops_ticket_update),
             web.post("/api/app/register", self.handle_register),
             web.post("/api/app/login", self.handle_login),
             web.post("/api/app/auth/sms/send", self.handle_send_sms_code),
             web.post("/api/app/auth/sms/verify", self.handle_verify_sms_code),
+            web.post("/api/app/auth/password/reset", self.handle_reset_password),
+            web.post("/api/app/telemetry/crash", self.handle_app_crash),
+            web.post("/api/app/telemetry/api", self.handle_app_api_metric),
             web.post("/api/app/demo-login", self.handle_demo_login),
             web.get("/api/app/me", self.handle_me),
+            web.delete("/api/app/me", self.handle_delete_account),
+            web.get("/api/app/me/export", self.handle_export_account),
+            web.get("/api/app/support/tickets", self.handle_support_tickets),
+            web.post("/api/app/support/tickets", self.handle_create_support_ticket),
             web.get("/api/app/spirit-power", self.handle_spirit_power),
             web.get("/api/app/spirit-power/items", self.handle_spirit_power_items),
             web.post("/api/app/spirit-power/check-in", self.handle_spirit_power_check_in),
             web.post("/api/app/spirit-power/items/use", self.handle_spirit_dew_use),
             web.post("/api/app/me/password", self.handle_update_password),
             web.get("/api/app/admin/metrics", self.handle_admin_metrics),
+            web.get("/api/app/admin/users", self.handle_admin_users),
             web.get("/api/app/admin/conversations", self.handle_admin_conversations),
             web.get("/api/app/admin/energy-events", self.handle_admin_energy_events),
             web.get("/api/app/admin/spirit-power-events", self.handle_admin_energy_events),
@@ -183,12 +213,21 @@ class AppDemoHandler(BaseHandler):
         payload = await self._read_json(request)
         if payload.get("phone") is None:
             return await self._handle_invite_auth_payload(payload)
+        if payload.get("confirm_password") is not None and str(
+            payload.get("password", "")
+        ) != str(payload.get("confirm_password", "")):
+            return self._error_response("两次输入的密码不一致", status=400)
         try:
+            auth_settings = self.config.get("app_mvp", {}).get("auth", {}) or {}
             result = register_phone_user(
                 self.config,
                 phone=str(payload.get("phone", "")).strip(),
                 password=str(payload.get("password", "")),
                 nickname=str(payload.get("nickname", "")).strip(),
+                verification_code=str(payload.get("code", "")).strip(),
+                require_verification=bool(
+                    auth_settings.get("registration_verification_required", False)
+                ),
             )
         except ValueError as e:
             return self._error_response(str(e), status=400)
@@ -272,6 +311,57 @@ class AppDemoHandler(BaseHandler):
             return self._error_response(str(error), status=400)
         return self._json_response(result)
 
+    async def handle_reset_password(self, request):
+        payload = await self._read_json(request)
+        new_password = str(payload.get("new_password", ""))
+        if new_password != str(payload.get("confirm_password", "")):
+            return self._error_response("两次输入的密码不一致", status=400)
+        try:
+            reset_user_password_with_sms(
+                self.config,
+                phone=str(payload.get("phone", "")).strip(),
+                code=str(payload.get("code", "")).strip(),
+                new_password=new_password,
+            )
+        except ValueError as error:
+            return self._error_response(str(error), status=400)
+        return self._json_response({"ok": True})
+
+    async def handle_app_crash(self, request):
+        return await self._handle_app_telemetry(request, "crash")
+
+    async def handle_app_api_metric(self, request):
+        return await self._handle_app_telemetry(request, "api")
+
+    async def _handle_app_telemetry(self, request, event_type):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        if request.content_length and request.content_length > 16 * 1024:
+            return self._error_response("上报内容过大", status=413)
+        try:
+            payload = await self._read_json(request)
+            result = record_app_telemetry(
+                self.config, user["id"], event_type, payload
+            )
+            from core.telemetry import app_api_reported, app_crash_reported
+
+            if event_type == "crash":
+                app_crash_reported(
+                    str(payload.get("platform", "")),
+                    str(payload.get("error_type", "")),
+                )
+            else:
+                app_api_reported(
+                    str(payload.get("platform", "")),
+                    str(payload.get("route", "")),
+                    payload.get("status_code"),
+                    payload.get("duration_ms", 0),
+                )
+            return self._json_response(result, status=202)
+        except (TypeError, ValueError) as error:
+            return self._error_response(str(error), status=400)
+
     async def _handle_invite_auth(self, request):
         payload = await self._read_json(request)
         return await self._handle_invite_auth_payload(payload)
@@ -288,6 +378,9 @@ class AppDemoHandler(BaseHandler):
         return self._json_response(result)
 
     async def handle_demo_login(self, request):
+        auth_settings = self.config.get("app_mvp", {}).get("auth", {}) or {}
+        if not bool(auth_settings.get("demo_login_enabled", True)):
+            return self._error_response("Demo 登录已关闭", status=404)
         return self._json_response(
             {
                 "token": DEMO_TOKEN,
@@ -301,6 +394,21 @@ class AppDemoHandler(BaseHandler):
         if not user:
             return self._error_response("未登录或 token 无效", status=401)
         return self._json_response(user_summary(self.config, user["id"]))
+
+    async def handle_delete_account(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        payload = await self._read_json(request)
+        if str(payload.get("confirmation", "")).strip() != "注销账号":
+            return self._error_response("请输入“注销账号”确认", status=400)
+        try:
+            deleted = delete_user_account(self.config, user["id"])
+        except ValueError as e:
+            return self._error_response(str(e), status=409)
+        if not deleted:
+            return self._error_response("账号不存在", status=404)
+        return self._json_response({"deleted": True})
 
     async def handle_spirit_power(self, request):
         user = self._current_user(request)
@@ -338,24 +446,174 @@ class AppDemoHandler(BaseHandler):
         if not user:
             return self._error_response("未登录或 token 无效", status=401)
         payload = await self._read_json(request)
+        new_password = str(payload.get("new_password", ""))
+        if new_password != str(payload.get("confirm_password", "")):
+            return self._error_response("两次输入的密码不一致", status=400)
         try:
             updated = update_user_password(
                 self.config,
                 user["id"],
                 old_password=str(payload.get("old_password", "")),
-                new_password=str(payload.get("new_password", "")),
+                new_password=new_password,
             )
         except ValueError as e:
             return self._error_response(str(e), status=400)
         if not updated:
             return self._error_response("旧密码错误", status=403)
-        return self._json_response({"updated": True})
+        return self._json_response({"updated": True, "requires_reauthentication": True})
 
     async def handle_admin_metrics(self, request):
         response = self._require_admin_response(request)
         if response:
             return response
         return self._json_response(admin_metrics(self.config))
+
+    async def handle_admin_users(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        return self._json_response({"items": list_admin_users(self.config)})
+
+    async def handle_support_page(self, request):
+        return web.Response(text=self._public_page(
+            "白泽幼灵支持",
+            "如需账号、设备、隐私或使用帮助，请发送邮件至 ranlimaowc@163.com。我们会尽快处理。",
+        ), content_type="text/html", charset="utf-8")
+
+    async def handle_privacy_page(self, request):
+        return web.Response(text=self._public_page(
+            "白泽幼灵隐私政策",
+            "燃力猫文化创意有限公司仅在提供账号、设备绑定、语音陪伴、日记与安全保障所必需的范围内处理信息。你可以在 App 的“我的 → 隐私与账号”中注销账号，或通过 ranlimaowc@163.com 联系我们行使访问、更正、删除等权利。",
+        ), content_type="text/html", charset="utf-8")
+
+    async def handle_account_deletion_page(self, request):
+        return web.Response(text=self._public_page(
+            "注销白泽幼灵账号",
+            "请在 App 内打开“我的 → 隐私与账号 → 注销账号”，确认后账号及其个人数据将被永久删除，设备会自动解绑。如无法进入 App，请联系 ranlimaowc@163.com。",
+        ), content_type="text/html", charset="utf-8")
+
+    async def handle_status_page(self, request):
+        return web.Response(text=self._public_page(
+            "山海幼灵服务状态",
+            "当前账号、设备绑定和陪伴服务运行正常。如你遇到问题，请在 App 的“帮助与售后”提交工单，或发送邮件至 ranlimaowc@163.com。",
+        ), content_type="text/html", charset="utf-8")
+
+    async def handle_dashboard_login(self, request):
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        client_ip = forwarded or request.remote or "unknown"
+        now = asyncio.get_running_loop().time()
+        attempts = [
+            timestamp
+            for timestamp in self._dashboard_login_failures.get(client_ip, [])
+            if now - timestamp < 900
+        ]
+        self._dashboard_login_failures[client_ip] = attempts
+        if len(attempts) >= 5:
+            return self._error_response("登录失败次数过多，请 15 分钟后重试", status=429)
+        payload = await self._read_json(request)
+        try:
+            result = login_dashboard_admin(
+                self.config,
+                str(payload.get("username", "")),
+                str(payload.get("password", "")),
+            )
+        except ValueError as e:
+            attempts.append(now)
+            return self._error_response(str(e), status=401)
+        self._dashboard_login_failures.pop(client_ip, None)
+        return self._json_response(result)
+
+    async def handle_dashboard_summary(self, request):
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+        if not dashboard_admin_for_token(self.config, token):
+            return self._error_response("运营登录已失效", status=401)
+        return self._json_response({
+            "metrics": admin_metrics(self.config),
+            "users": list_admin_users(self.config),
+            "operations": operations_snapshot(self.config),
+        })
+
+    def _dashboard_admin(self, request) -> str | None:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+        return dashboard_admin_for_token(self.config, token)
+
+    async def handle_ops_tickets(self, request):
+        if not self._dashboard_admin(request):
+            return self._error_response("运营登录已失效", status=401)
+        try:
+            items = list_ops_support_tickets(self.config, request.query.get("status"))
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        return self._json_response({"items": items})
+
+    async def handle_ops_ticket_update(self, request):
+        username = self._dashboard_admin(request)
+        if not username:
+            return self._error_response("运营登录已失效", status=401)
+        payload = await self._read_json(request)
+        try:
+            ticket = update_support_ticket(
+                self.config,
+                request.match_info["ticket_id"],
+                str(payload.get("status", "")),
+                str(payload.get("operator_reply", "")),
+                username,
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not ticket:
+            return self._error_response("工单不存在", status=404)
+        return self._json_response(ticket)
+
+    async def handle_export_account(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        data = export_user_data(self.config, user["id"])
+        if not data:
+            return self._error_response("账号不存在", status=404)
+        return self._json_response(data)
+
+    async def handle_support_tickets(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        return self._json_response({"items": list_user_support_tickets(self.config, user["id"])})
+
+    async def handle_create_support_ticket(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        payload = await self._read_json(request)
+        try:
+            ticket = create_support_ticket(
+                self.config,
+                user["id"],
+                str(payload.get("category", "other")),
+                str(payload.get("subject", "")),
+                str(payload.get("message", "")),
+                str(payload.get("device_id", "")) or None,
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=429 if "频繁" in str(e) else 400)
+        return self._json_response(ticket, status=201)
+
+    async def handle_dashboard_page(self, request):
+        return web.Response(text=self._operations_dashboard_html(), content_type="text/html", charset="utf-8")
+
+    @staticmethod
+    def _operations_dashboard_html() -> str:
+        return """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>山海幼灵运营中心</title><style>:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#edf4ff;color:#18345f;font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif}main{max-width:1240px;margin:auto;padding:28px}.card{background:#fff;border:1px solid #dce7f5;border-radius:20px;padding:20px;margin:14px 0;box-shadow:0 10px 32px #214a7a12}input,select,textarea,button{font:inherit;padding:11px 13px;border:1px solid #cbd9ea;border-radius:11px;margin:4px}textarea{min-width:260px;min-height:76px}button{background:#28558e;color:#fff;border:0;cursor:pointer}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}.metric{margin:0}.metric b{font-size:27px;display:block}.tabs button{background:#dce9f8;color:#244b7b}.tabs button.active{background:#28558e;color:#fff}.table{overflow:auto}table{width:100%;border-collapse:collapse;min-width:720px}th,td{text-align:left;padding:11px 8px;border-bottom:1px solid #e8eef6;vertical-align:top}th{color:#657896}.badge{display:inline-block;padding:3px 8px;border-radius:99px;background:#e5eef9}.warn{color:#b54708}#error{color:#b42318}@media(max-width:700px){main{padding:12px}.card{padding:14px}}</style><main><h1>山海幼灵运营中心</h1><p>用户、设备、版本、异常与售后工单 · 轻量同进程运行</p><section id="login" class="card"><input id="username" autocomplete="username" placeholder="运营账号"><input id="password" type="password" autocomplete="current-password" placeholder="密码"><button onclick="signIn()">登录</button><span id="error"></span></section><section id="content" hidden><div id="metrics" class="metrics"></div><div class="tabs"><button id="usersTab" onclick="showTab('users')">用户</button><button id="devicesTab" onclick="showTab('devices')">设备</button><button id="ticketsTab" onclick="showTab('tickets')">售后工单</button><button onclick="load()">刷新</button><button onclick="signOut()">退出</button></div><div id="users" class="card table"></div><div id="devices" class="card table" hidden></div><div id="tickets" class="card table" hidden></div></section><small>运营主体：燃力猫文化创意有限公司 · 客服 ranlimaowc@163.com</small><script>const $=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let token=sessionStorage.getItem('baize_ops_token');async function request(path,opt={}){let r=await fetch(path,{...opt,headers:{'Content-Type':'application/json',...(token?{'Authorization':'Bearer '+token}:{}),...opt.headers}}),j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j}async function signIn(){try{let j=await request('/api/app/ops/login',{method:'POST',body:JSON.stringify({username:$('username').value,password:$('password').value})});token=j.token;sessionStorage.setItem('baize_ops_token',token);await load()}catch(e){$('error').textContent=e.message}}function signOut(){sessionStorage.removeItem('baize_ops_token');token='';$('login').hidden=false;$('content').hidden=true}function showTab(name){for(let n of ['users','devices','tickets']){$(n).hidden=n!==name;$(n+'Tab').className=n===name?'active':''}}function table(headers,rows){return '<table><thead><tr>'+headers.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody></table>'}async function load(){try{let j=await request('/api/app/ops/summary'),m=j.metrics,o=j.operations,u=j.users,t=await request('/api/app/ops/tickets');$('login').hidden=true;$('content').hidden=false;$('metrics').innerHTML=[['用户',m.users],['已绑定设备',m.bound_devices],['待处理工单',o.open_tickets],['24h 崩溃',o.app_crashes_24h],['24h 接口 5xx',o.app_api_5xx_24h],['对话',m.dialogues]].map(x=>`<div class="card metric"><b>${esc(x[1])}</b>${esc(x[0])}</div>`).join('');$('users').innerHTML=table(['用户','手机号','登录','设备','最后登录'],u.map(x=>`<tr><td><b>${esc(x.nickname)}</b><br><small>${esc(x.id)}</small></td><td>${esc(x.masked_phone||'—')}</td><td>${esc(x.login_type)}${x.has_password?' · 有密码':''}</td><td>${esc(x.device_count)} ${esc(x.device_names.join('、'))}</td><td>${esc(x.last_login_at)}</td></tr>`));$('devices').innerHTML='<p>固件分布：'+Object.entries(o.firmware_versions).map(x=>esc(x[0])+' × '+esc(x[1])).join('，')+'</p>'+table(['设备','型号/版本','状态/电量','绑定用户','最后在线'],o.devices.map(x=>`<tr><td><b>${esc(x.display_name)}</b><br><small>${esc(x.id)}</small></td><td>${esc(x.model||'—')}<br>${esc(x.firmware_version||'—')}</td><td class="${x.online_status==='online'?'':'warn'}">${esc(x.online_status)} · ${esc(x.battery_percent??'—')}%</td><td>${esc(x.bound_user_id||'未绑定')}</td><td>${esc(x.last_online_at||'从未')}</td></tr>`));$('tickets').innerHTML=table(['状态','用户/设备','问题','时间','处理'],t.items.map(x=>`<tr><td><span class="badge">${esc(x.status)}</span></td><td>${esc(x.nickname)} · ${esc(x.masked_phone||'—')}<br>${esc(x.device_name||'无设备')}</td><td><b>${esc(x.subject)}</b><br>${esc(x.message)}<br><small>${esc(x.operator_reply||'尚未回复')}</small></td><td>${esc(x.updated_at)}</td><td><select id="s_${esc(x.id)}"><option value="open">待处理</option><option value="in_progress">处理中</option><option value="resolved">已解决</option><option value="closed">已关闭</option></select><textarea id="r_${esc(x.id)}" placeholder="给用户的回复">${esc(x.operator_reply||'')}</textarea><button onclick="saveTicket('${esc(x.id)}')">保存</button></td></tr>`));for(let x of t.items){let s=$('s_'+x.id);if(s)s.value=x.status}showTab('users')}catch(e){signOut();$('error').textContent=e.message}}async function saveTicket(id){try{await request('/api/app/ops/tickets/'+encodeURIComponent(id),{method:'PUT',body:JSON.stringify({status:$('s_'+id).value,operator_reply:$('r_'+id).value})});await load();showTab('tickets')}catch(e){alert(e.message)}}if(token)load();</script></main></html>"""
+
+    @staticmethod
+    def _public_page(title: str, body: str) -> str:
+        return f"""<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>body{{margin:0;background:#f4f7ff;color:#16233f;font:16px/1.7 -apple-system,BlinkMacSystemFont,sans-serif}}main{{max-width:720px;margin:10vh auto;padding:32px;background:#fff;border-radius:24px;box-shadow:0 16px 50px #25477a18}}h1{{font-size:28px}}small{{color:#65728a}}</style><main><h1>{title}</h1><p>{body}</p><small>运营主体：燃力猫文化创意有限公司</small></main></html>"""
+
+    @staticmethod
+    def _admin_dashboard_html() -> str:
+        return """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>白泽运营中心</title><style>body{margin:0;background:#f1f5fb;color:#16233f;font:14px -apple-system,BlinkMacSystemFont,sans-serif}main{max-width:1180px;margin:auto;padding:28px}.card{background:#fff;border-radius:20px;padding:20px;margin:14px 0;box-shadow:0 10px 35px #24446c14}input,button{padding:11px 13px;border:1px solid #cdd8e8;border-radius:11px;margin:4px}button{background:#244f88;color:#fff;border:0;cursor:pointer}.metrics{display:flex;gap:12px;flex-wrap:wrap}.metric{min-width:130px}.metric b{font-size:26px;display:block}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 8px;border-bottom:1px solid #e8edf5}th{color:#65728a}#error{color:#b42318}@media(max-width:700px){main{padding:12px}.table{overflow:auto}}</style><main><h1>白泽运营中心</h1><p>独立运营账号 · 只读用户概览 · 手机号掩码展示</p><section id="login" class="card"><input id="username" autocomplete="username" placeholder="运营账号"><input id="password" type="password" autocomplete="current-password" placeholder="密码"><button onclick="signIn()">登录</button><span id="error"></span></section><section id="content" hidden><div id="metrics" class="metrics"></div><div class="card"><button onclick="load()">刷新</button><button onclick="signOut()">退出</button><div class="table"><table><thead><tr><th>用户</th><th>手机号</th><th>登录</th><th>设备</th><th>最后登录</th></tr></thead><tbody id="rows"></tbody></table></div></div></section><small>运营主体：燃力猫文化创意有限公司</small><script>const $=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));let token=sessionStorage.getItem('baize_ops_token');async function request(path,opt={}){let r=await fetch(path,{...opt,headers:{'Content-Type':'application/json',...(token?{'Authorization':'Bearer '+token}:{}),...opt.headers}}),j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j}async function signIn(){try{let j=await request('/api/app/ops/login',{method:'POST',body:JSON.stringify({username:$('username').value,password:$('password').value})});token=j.token;sessionStorage.setItem('baize_ops_token',token);await load()}catch(e){$('error').textContent=e.message}}function signOut(){sessionStorage.removeItem('baize_ops_token');token='';$('login').hidden=false;$('content').hidden=true}async function load(){try{let j=await request('/api/app/ops/summary'),m=j.metrics,u=j.users;$('login').hidden=true;$('content').hidden=false;$('metrics').innerHTML=[['用户',m.users],['手机账号',m.phone_users],['已绑定设备',m.bound_devices],['对话',m.dialogues],['日记',m.diaries]].map(x=>`<div class="card metric"><b>${esc(x[1])}</b>${esc(x[0])}</div>`).join('');$('rows').innerHTML=u.map(x=>`<tr><td><b>${esc(x.nickname)}</b><br><small>${esc(x.id)}</small></td><td>${esc(x.masked_phone||'—')}</td><td>${esc(x.login_type)}${x.has_password?' · 有密码':''}</td><td>${esc(x.device_count)} ${esc(x.device_names.join('、'))}</td><td>${esc(x.last_login_at)}</td></tr>`).join('')}catch(e){signOut();$('error').textContent=e.message}}if(token)load();</script></main></html>"""
 
     async def handle_admin_conversations(self, request):
         response = self._require_admin_response(request)
