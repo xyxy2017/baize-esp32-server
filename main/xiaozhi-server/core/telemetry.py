@@ -19,6 +19,21 @@ STORED_DIALOGUES = Gauge("baize_stored_dialogues", "Total persisted App MVP dial
 STORED_DIARIES = Gauge("baize_stored_diaries", "Total persisted App MVP diaries.")
 STORED_ENERGY_SPENT = Gauge("baize_stored_energy_spent", "Total recorded spirit power consumption.")
 EMOTION_HITS = Gauge("baize_emotion_hits", "Persisted dialogue emotion counts.", ("emotion",))
+CONTENT_SAFETY_CHECKS = Counter(
+    "baize_content_safety_checks_total",
+    "Content safety checks by direction, action, category and provider.",
+    ("direction", "action", "category", "provider"),
+)
+CONTENT_SAFETY_DURATION = Histogram(
+    "baize_content_safety_check_duration_seconds",
+    "Content safety decision latency.",
+    ("direction", "provider"),
+)
+CONTENT_SAFETY_PROVIDER_ERRORS = Counter(
+    "baize_content_safety_provider_errors_total",
+    "Content safety provider errors and upstream guard blocks.",
+    ("provider",),
+)
 
 
 def observe_http_request(method: str, route: str, status: int, duration_seconds: float) -> None:
@@ -46,6 +61,28 @@ def diary_generated() -> None:
 def energy_spent(amount: int, reason: str) -> None:
     if amount > 0:
         ENERGY_SPENT.labels(reason=reason or "unknown").inc(amount)
+
+
+def content_safety_checked(
+    direction: str,
+    action: str,
+    category: str,
+    provider: str,
+    latency_seconds: float,
+) -> None:
+    CONTENT_SAFETY_CHECKS.labels(
+        direction=direction or "unknown",
+        action=action or "unknown",
+        category=category or "none",
+        provider=provider or "unknown",
+    ).inc()
+    CONTENT_SAFETY_DURATION.labels(
+        direction=direction or "unknown", provider=provider or "unknown"
+    ).observe(max(0.0, latency_seconds))
+
+
+def content_safety_provider_error(provider: str) -> None:
+    CONTENT_SAFETY_PROVIDER_ERRORS.labels(provider=provider or "unknown").inc()
 
 
 def set_sqlite_health(ok: bool) -> None:

@@ -12,7 +12,9 @@
     {"type":"timeseries","title":"HTTP P95 \u54cd\u5e94\u8017\u65f6","gridPos":{"h":8,"w":12,"x":12,"y":5},"targets":[{"expr":"histogram_quantile(0.95, sum by (le) (rate(baize_http_request_duration_seconds_bucket[5m])))","legendFormat":"P95","refId":"A"}],"fieldConfig":{"defaults":{"unit":"s"}}},
     {"type":"timeseries","title":"WebSocket \u8fde\u63a5","gridPos":{"h":8,"w":8,"x":0,"y":13},"targets":[{"expr":"baize_websocket_connections_active","legendFormat":"\u5f53\u524d\u5728\u7ebf","refId":"A"},{"expr":"sum(rate(baize_websocket_connections_total[5m]))","legendFormat":"\u5b8c\u6210\u8fde\u63a5/\u79d2","refId":"B"}]},
     {"type":"timeseries","title":"\u966a\u4f34\u4e1a\u52a1\u6d3b\u52a8","gridPos":{"h":8,"w":8,"x":8,"y":13},"targets":[{"expr":"sum(rate(baize_dialogues_total[5m]))","legendFormat":"\u5bf9\u8bdd/\u79d2","refId":"A"},{"expr":"sum(rate(baize_diaries_generated_total[5m]))","legendFormat":"\u65e5\u8bb0/\u79d2","refId":"B"},{"expr":"sum(rate(baize_energy_spent_total[5m]))","legendFormat":"\u7cbe\u529b\u6d88\u8017/\u79d2","refId":"C"}]},
-    {"type":"timeseries","title":"\u7528\u6237\u4e0e\u5185\u5bb9\u5b58\u91cf","gridPos":{"h":8,"w":8,"x":16,"y":13},"targets":[{"expr":"baize_users","legendFormat":"\u7528\u6237\u6570","refId":"A"},{"expr":"baize_bound_devices","legendFormat":"\u7ed1\u5b9a\u8bbe\u5907\u6570","refId":"B"},{"expr":"baize_stored_dialogues","legendFormat":"\u5bf9\u8bdd\u6570","refId":"C"},{"expr":"baize_stored_diaries","legendFormat":"\u65e5\u8bb0\u6570","refId":"D"}]}
+    {"type":"timeseries","title":"\u7528\u6237\u4e0e\u5185\u5bb9\u5b58\u91cf","gridPos":{"h":8,"w":8,"x":16,"y":13},"targets":[{"expr":"baize_users","legendFormat":"\u7528\u6237\u6570","refId":"A"},{"expr":"baize_bound_devices","legendFormat":"\u7ed1\u5b9a\u8bbe\u5907\u6570","refId":"B"},{"expr":"baize_stored_dialogues","legendFormat":"\u5bf9\u8bdd\u6570","refId":"C"},{"expr":"baize_stored_diaries","legendFormat":"\u65e5\u8bb0\u6570","refId":"D"}]},
+    {"type":"timeseries","title":"\u98ce\u63a7\u62e6\u622a\u8d8b\u52bf","gridPos":{"h":8,"w":12,"x":0,"y":21},"targets":[{"expr":"sum by (category, direction) (rate(baize_content_safety_checks_total{action=\"block\"}[5m]))","legendFormat":"{{direction}} / {{category}}","refId":"A"}]},
+    {"type":"timeseries","title":"\u98ce\u63a7\u68c0\u67e5\u8017\u65f6\u4e0e\u4e0a\u6e38\u62a4\u680f\u5f02\u5e38","gridPos":{"h":8,"w":12,"x":12,"y":21},"targets":[{"expr":"histogram_quantile(0.95, sum by (le, provider, direction) (rate(baize_content_safety_check_duration_seconds_bucket[5m])))","legendFormat":"P95 {{provider}} / {{direction}}","refId":"A"},{"expr":"sum by (provider) (rate(baize_content_safety_provider_errors_total[5m]))","legendFormat":"\u4e0a\u6e38\u62a4\u680f\u62e6\u622a/\u5f02\u5e38 {{provider}}","refId":"B"}]}
   ],
   "schemaVersion": 39,
   "tags": ["baize"],
@@ -20,5 +22,5 @@
   "time": {"from":"now-6h","to":"now"},
   "title": "\u767d\u6cfd\u670d\u52a1\u603b\u89c8",
   "uid": "baize-overview",
-  "version": 1
+  "version": 2
 }

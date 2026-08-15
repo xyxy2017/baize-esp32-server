@@ -41,9 +41,11 @@ def initialize_modules(
             if "type" not in config["LLM"][select_llm_module]
             else config["LLM"][select_llm_module]["type"]
         )
+        llm_config = dict(config["LLM"][select_llm_module])
+        llm_config["_content_safety"] = config.get("content_safety", {}) or {}
         modules["llm"] = llm.create_instance(
             llm_type,
-            config["LLM"][select_llm_module],
+            llm_config,
         )
         logger.bind(tag=TAG).info(f"初始化组件: llm成功 {select_llm_module}")
 

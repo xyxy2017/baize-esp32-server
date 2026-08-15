@@ -3,6 +3,11 @@ import copy
 from aiohttp import web
 from config.logger import setup_logging
 from core.api.base_handler import BaseHandler
+from core.content_safety import (
+    append_content_safety_prompt,
+    blocked_response,
+    moderate_text,
+)
 from core.utils.util import get_vision_url, is_valid_image_file
 from core.utils.vllm import create_instance
 from config.config_loader import get_private_config_from_api
@@ -73,7 +78,35 @@ class VisionHandler(BaseHandler):
             if question_field is None:
                 raise ValueError("缺少问题字段")
             question = await question_field.text()
-            self.logger.bind(tag=TAG).debug(f"Question: {question}")
+            self.logger.bind(tag=TAG, question_chars=len(question or "")).debug(
+                "vision_question_received"
+            )
+            input_decision = moderate_text(
+                self.config,
+                question,
+                direction="input",
+                source="vision",
+                device_id=device_id,
+                session_id=f"vision_{client_id or device_id}",
+            )
+            if input_decision.blocked:
+                return_json = {
+                    "success": True,
+                    "action": Action.RESPONSE.name,
+                    "response": blocked_response(
+                        self.config, input_decision, direction="input"
+                    ),
+                    "blocked": True,
+                    "safety": input_decision.public_payload(),
+                    "ai_generated": True,
+                }
+                response = web.Response(
+                    text=json.dumps(
+                        return_json, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    content_type="application/json",
+                )
+                return response
 
             # 读取图片文件
             image_field = await reader.next()
@@ -127,27 +160,48 @@ class VisionHandler(BaseHandler):
                 vllm_type, current_config["VLLM"][select_vllm_module]
             )
 
-            result = vllm.response(question, image_base64)
+            guarded_question = append_content_safety_prompt(self.config, question)
+            result = str(vllm.response(guarded_question, image_base64) or "")
+            output_decision = moderate_text(
+                self.config,
+                result,
+                direction="output",
+                source="vision",
+                device_id=device_id,
+                session_id=f"vision_{client_id or device_id}",
+            )
+            if output_decision.blocked:
+                result = blocked_response(
+                    self.config, output_decision, direction="output"
+                )
 
             return_json = {
                 "success": True,
                 "action": Action.RESPONSE.name,
                 "response": result,
+                "blocked": output_decision.blocked,
+                "ai_generated": True,
             }
+            if output_decision.blocked:
+                return_json["safety"] = output_decision.public_payload()
 
             response = web.Response(
                 text=json.dumps(return_json, separators=(",", ":")),
                 content_type="application/json",
             )
         except ValueError as e:
-            self.logger.bind(tag=TAG).error(f"MCP Vision POST请求异常: {e}")
+            self.logger.bind(tag=TAG, error_type=type(e).__name__).error(
+                "vision_post_validation_failed"
+            )
             return_json = self._create_error_response(str(e))
             response = web.Response(
                 text=json.dumps(return_json, separators=(",", ":")),
                 content_type="application/json",
             )
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"MCP Vision POST请求异常: {e}")
+            self.logger.bind(tag=TAG, error_type=type(e).__name__).error(
+                "vision_post_failed"
+            )
             return_json = self._create_error_response("处理请求时发生错误")
             response = web.Response(
                 text=json.dumps(return_json, separators=(",", ":")),
@@ -171,7 +225,9 @@ class VisionHandler(BaseHandler):
 
             response = web.Response(text=message, content_type="text/plain")
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"MCP Vision GET请求异常: {e}")
+            self.logger.bind(tag=TAG, error_type=type(e).__name__).error(
+                "vision_get_failed"
+            )
             return_json = self._create_error_response("服务器内部错误")
             response = web.Response(
                 text=json.dumps(return_json, separators=(",", ":")),

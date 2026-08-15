@@ -107,7 +107,9 @@ async def checkWakeupWords(conn: "ConnectionHandler", text):
     # 将唤醒词回复视为新会话，生成新的 sentence_id，确保流控器重置
     conn.sentence_id = str(uuid.uuid4().hex)
 
-    conn.logger.bind(tag=TAG).info(f"播放唤醒词回复: {response.get('text')}")
+    conn.logger.bind(
+        tag=TAG, text_chars=len(response.get("text") or "")
+    ).info("wakeup_reply_played")
     await sendAudioMessage(conn, SentenceType.FIRST, opus_packets, response.get("text"))
     await sendAudioMessage(conn, SentenceType.LAST, [], None)
 

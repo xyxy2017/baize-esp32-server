@@ -23,7 +23,9 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
         return
 
     if conn.tts.tts_audio_first_sentence:
-        conn.logger.bind(tag=TAG).info(f"发送第一段语音: {text}")
+        conn.logger.bind(tag=TAG, text_chars=len(text or "")).info(
+            "tts_first_audio_sent"
+        )
         conn.tts.tts_audio_first_sentence = False
 
     if sentenceType == SentenceType.FIRST:
@@ -47,7 +49,11 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
     await sendAudio(conn, audios)
     # 发送句子开始消息
     if sentenceType is not SentenceType.MIDDLE:
-        conn.logger.bind(tag=TAG).info(f"发送音频消息: {sentenceType}, {text}")
+        conn.logger.bind(
+            tag=TAG,
+            sentence_type=str(sentenceType),
+            text_chars=len(text or ""),
+        ).info("tts_audio_message_sent")
 
     # 发送结束消息（如果是最后一个文本）
     # 通话需要维持speaking状态

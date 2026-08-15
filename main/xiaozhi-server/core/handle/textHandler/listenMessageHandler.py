@@ -62,7 +62,9 @@ class ListenTextMessageHandler(TextMessageHandler):
                 if original_text.startswith("[device_call]"):
                     # 提取 tag 后的文本
                     call_text = original_text[len("[device_call]"):].strip()
-                    conn.logger.bind(tag=TAG).info(f"收到设备呼叫指令: {call_text}")
+                    conn.logger.bind(tag=TAG, text_chars=len(call_text)).info(
+                        "device_call_received"
+                    )
 
                     # 准备开始新会话
                     conn.sentence_id = uuid.uuid4().hex

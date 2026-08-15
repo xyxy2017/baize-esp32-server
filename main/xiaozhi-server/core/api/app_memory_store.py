@@ -664,6 +664,7 @@ def _is_health_memory(content: str) -> bool:
 def _upsert_candidate_conn(
     conn: sqlite3.Connection,
     *,
+    safety_config: dict | None = None,
     user_id: str,
     device_id: str,
     scope: str,
@@ -688,6 +689,10 @@ def _upsert_candidate_conn(
         raise ValueError("content 不能为空")
     if _contains_blocked_sensitive_data(content):
         raise ValueError("内容包含不能保存的敏感信息")
+    from core.content_safety import evaluate_text
+
+    if not evaluate_text(safety_config or {}, content, direction="memory").allowed:
+        raise ValueError("记忆内容不符合安全规则")
     if _is_health_memory(content) and not explicit:
         return None
     scope = normalize_memory_scope(scope)
@@ -899,6 +904,10 @@ def create_memory(
     source: str = "manual",
     explicit: bool = True,
 ) -> dict[str, Any] | None:
+    from core.content_safety import evaluate_text
+
+    if not evaluate_text(config, content, direction="memory").allowed:
+        raise ValueError("记忆内容不符合安全规则")
     memory_type = _validated_memory_type(memory_type)
     scope = _validated_memory_scope(
         scope, allow_pet=source in {"growth", "system"}
@@ -907,6 +916,7 @@ def create_memory(
         ensure_memory_v2_schema(conn)
         result = _upsert_candidate_conn(
             conn,
+            safety_config=config,
             user_id=user_id,
             device_id=device_id,
             scope=scope,
@@ -953,6 +963,10 @@ def update_memory(
             raise ValueError("content 不能为空")
         if _contains_blocked_sensitive_data(content):
             raise ValueError("内容包含不能保存的敏感信息")
+        from core.content_safety import evaluate_text
+
+        if not evaluate_text(config, content, direction="memory").allowed:
+            raise ValueError("记忆内容不符合安全规则")
         memory_type = _validated_memory_type(
             values.get("type", values.get("category", row["type"]))
         )
@@ -1280,12 +1294,14 @@ def apply_dialogue_rules_conn(
     dialogue_id: str,
     user_text: str,
     relationship_id: str | None = None,
+    config: dict | None = None,
 ) -> list[dict[str, Any]]:
     memories = []
     for candidate in _classify_rule_candidates((user_text or "").strip()):
         try:
             memory = _upsert_candidate_conn(
                 conn,
+                safety_config=config,
                 user_id=user_id,
                 device_id=device_id,
                 scope=candidate["scope"],
@@ -1355,7 +1371,14 @@ def record_dialogue_memory_conn(
         return []
     memories: list[dict[str, Any]] = []
     if not opt_out:
-        memories = apply_dialogue_rules_conn(conn, user_id, device_id, dialogue_id, user_text)
+        memories = apply_dialogue_rules_conn(
+            conn,
+            user_id,
+            device_id,
+            dialogue_id,
+            user_text,
+            config=config,
+        )
         enqueue_dialogue_job_conn(
             conn, user_id, device_id, dialogue_id, run_rules=False
         )
@@ -1498,6 +1521,7 @@ def apply_extraction_candidates(
                     dialogue["id"],
                     dialogue["user_text"],
                     relationship_id=relationship["id"],
+                    config=config,
                 )
             )
         min_confidence = float(memory_v2_config(config).get("min_confidence", 0.75))
@@ -1512,6 +1536,7 @@ def apply_extraction_candidates(
                     continue
                 memory = _upsert_candidate_conn(
                     conn,
+                    safety_config=config,
                     user_id=user_id,
                     device_id=device_id,
                     scope=candidate.get("scope", "relationship"),
@@ -1813,6 +1838,13 @@ def retrieve_memory_context(
             """,
             (_now(), user_id, relationship["id"], device_id),
         ).fetchall()
+        from core.content_safety import evaluate_text
+
+        rows = [
+            row
+            for row in rows
+            if evaluate_text(config, row["content"], direction="memory").allowed
+        ]
         pinned_limit = max(0, min(int(settings.get("pinned_limit", 5)), 10))
         top_k = max(0, min(int(settings.get("retrieval_top_k", 5)), 10))
         pinned_rows = sorted(

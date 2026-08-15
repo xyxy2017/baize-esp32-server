@@ -69,7 +69,22 @@ from core.api.sms_sender import (
     SMSConfigurationError,
     SMSProviderError,
 )
-from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool, _refresh_device_status_report
+from core.content_safety import (
+    append_content_safety_prompt,
+    blocked_response,
+    content_safety_summary,
+    create_safety_appeal,
+    is_provider_moderation_error,
+    list_safety_appeals,
+    list_safety_events,
+    moderate_text,
+    provider_block_decision,
+    resolve_safety_appeal,
+)
+from core.providers.tools.device_mcp.mcp_handler import (
+    _refresh_device_status_report,
+    call_mcp_tool,
+)
 from core.utils import llm as llm_utils
 from core.utils.prompt_manager import PromptManager
 
@@ -124,6 +139,12 @@ class AppDemoHandler(BaseHandler):
             web.post("/api/app/admin/devices/{device_id}/rotate-code", self.handle_admin_rotate_device_code),
             web.post("/api/app/admin/memory/rebuild", self.handle_admin_memory_rebuild),
             web.get("/api/app/admin/memory/jobs", self.handle_admin_memory_jobs),
+            web.get("/api/app/admin/content-safety/summary", self.handle_admin_content_safety_summary),
+            web.get("/api/app/admin/content-safety/events", self.handle_admin_content_safety_events),
+            web.post("/api/app/admin/content-safety/check", self.handle_admin_content_safety_check),
+            web.get("/api/app/admin/content-safety/appeals", self.handle_admin_content_safety_appeals),
+            web.put("/api/app/admin/content-safety/appeals/{appeal_id}", self.handle_admin_resolve_content_safety_appeal),
+            web.post("/api/app/content-safety/appeals", self.handle_content_safety_appeal),
             web.get("/api/app/devices", self.handle_devices),
             web.post("/api/app/devices/bind", self.handle_bind_device),
             web.get("/api/app/devices/{device_id}", self.handle_device_detail),
@@ -422,6 +443,94 @@ class AppDemoHandler(BaseHandler):
             return self._error_response(str(e), status=400)
         return self._json_response({"items": items})
 
+    async def handle_admin_content_safety_summary(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        return self._json_response(content_safety_summary(self.config))
+
+    async def handle_admin_content_safety_events(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        items = list_safety_events(
+            self.config,
+            action=str(request.query.get("action", "")).strip() or None,
+            category=str(request.query.get("category", "")).strip() or None,
+            direction=str(request.query.get("direction", "")).strip() or None,
+            source=str(request.query.get("source", "")).strip() or None,
+            limit=self._limit(request),
+        )
+        return self._json_response({"items": items})
+
+    async def handle_admin_content_safety_check(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        payload = await self._read_json(request)
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            return self._error_response("text 不能为空", status=400)
+        direction = str(payload.get("direction", "input")).strip() or "input"
+        decision = moderate_text(
+            self.config,
+            text,
+            direction=direction,
+            source="admin_check",
+            session_id=f"admin_check_{uuid.uuid4().hex}",
+        )
+        return self._json_response(decision.public_payload())
+
+    async def handle_content_safety_appeal(self, request):
+        user = self._current_user(request)
+        if not user:
+            return self._error_response("未登录或 token 无效", status=401)
+        payload = await self._read_json(request)
+        try:
+            appeal = create_safety_appeal(
+                self.config,
+                user["id"],
+                str(payload.get("event_id", "")).strip(),
+                str(payload.get("reason", "")).strip(),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not appeal:
+            return self._error_response("风控事件不存在", status=404)
+        return self._json_response(appeal)
+
+    async def handle_admin_content_safety_appeals(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        return self._json_response(
+            {
+                "items": list_safety_appeals(
+                    self.config,
+                    status=str(request.query.get("status", "")).strip() or None,
+                    limit=self._limit(request),
+                )
+            }
+        )
+
+    async def handle_admin_resolve_content_safety_appeal(self, request):
+        response = self._require_admin_response(request)
+        if response:
+            return response
+        payload = await self._read_json(request)
+        try:
+            appeal = resolve_safety_appeal(
+                self.config,
+                request.match_info["appeal_id"],
+                status=str(payload.get("status", "")).strip(),
+                resolution_note=str(payload.get("resolution_note", "")).strip(),
+            )
+        except ValueError as e:
+            return self._error_response(str(e), status=400)
+        if not appeal:
+            return self._error_response("申诉不存在", status=404)
+        return self._json_response(appeal)
+
     async def handle_devices(self, request):
         user = self._current_user(request)
         if not user:
@@ -555,12 +664,27 @@ class AppDemoHandler(BaseHandler):
         if isinstance(device_or_response, web.Response):
             return device_or_response
         payload = await self._read_json(request)
+        memory_content = str(payload.get("content", "")).strip()
+        safety = moderate_text(
+            self.config,
+            memory_content,
+            direction="memory",
+            source="memory_api",
+            user_id=user["id"],
+            device_id=device_or_response["id"],
+            session_id=f"memory_api_{uuid.uuid4().hex}",
+        )
+        if safety.blocked:
+            return self._json_response(
+                {"created": False, "blocked": True, "safety": safety.public_payload()},
+                status=422,
+            )
         try:
             memory = create_memory_item(
                 self.config,
                 user["id"],
                 device_or_response["id"],
-                content=str(payload.get("content", "")).strip(),
+                content=memory_content,
                 memory_type=str(
                     payload.get("type", payload.get("category", "note"))
                 ).strip(),
@@ -582,6 +706,25 @@ class AppDemoHandler(BaseHandler):
         if isinstance(device_or_response, web.Response):
             return device_or_response
         payload = await self._read_json(request)
+        if "content" in payload:
+            safety = moderate_text(
+                self.config,
+                str(payload.get("content", "")).strip(),
+                direction="memory",
+                source="memory_api",
+                user_id=user["id"],
+                device_id=device_or_response["id"],
+                session_id=f"memory_api_{uuid.uuid4().hex}",
+            )
+            if safety.blocked:
+                return self._json_response(
+                    {
+                        "updated": False,
+                        "blocked": True,
+                        "safety": safety.public_payload(),
+                    },
+                    status=422,
+                )
         try:
             memory = update_memory_item(
                 self.config,
@@ -660,13 +803,31 @@ class AppDemoHandler(BaseHandler):
         if isinstance(device_or_response, web.Response):
             return device_or_response
         device = device_or_response
-        if user_summary(self.config, user["id"])["spirit_power"]["current"] < 5:
-            return self._error_response("白泽的灵力不足，稍后恢复一些再来陪你。", status=409)
-
         payload = await self._read_json(request)
         user_text = str(payload.get("text", "")).strip()
         if not user_text:
             return self._error_response("text 不能为空", status=400)
+        safety_session_id = f"debug_guard_{uuid.uuid4().hex}"
+        input_decision = moderate_text(
+            self.config,
+            user_text,
+            direction="input",
+            source="debug_chat",
+            user_id=user["id"],
+            device_id=device["id"],
+            session_id=safety_session_id,
+        )
+        if input_decision.blocked:
+            return self._json_response(
+                {
+                    "reply": blocked_response(self.config, input_decision, direction="input"),
+                    "blocked": True,
+                    "safety": input_decision.public_payload(),
+                    "ai_generated": True,
+                }
+            )
+        if user_summary(self.config, user["id"])["spirit_power"]["current"] < 5:
+            return self._error_response("白泽的灵力不足，稍后恢复一些再来陪你。", status=409)
         try:
             memory_control = {"handled": False, "opt_out": False}
             retrieval = None
@@ -681,7 +842,9 @@ class AppDemoHandler(BaseHandler):
                     user_text,
                     session_id="debug",
                 )
-            system_prompt = self._build_debug_prompt(device["id"])
+            system_prompt = append_content_safety_prompt(
+                self.config, self._build_debug_prompt(device["id"])
+            )
             if not system_prompt:
                 return self._error_response("未配置白泽 prompt", status=503)
             if retrieval and retrieval.get("context"):
@@ -696,10 +859,48 @@ class AppDemoHandler(BaseHandler):
             if not reply:
                 return self._error_response("LLM 未返回内容", status=502)
         except Exception as e:
+            if is_provider_moderation_error(e):
+                decision = provider_block_decision(
+                    self.config,
+                    text=user_text,
+                    direction="output",
+                    source="debug_chat",
+                    user_id=user["id"],
+                    device_id=device["id"],
+                    session_id=safety_session_id,
+                    error=e,
+                )
+                return self._json_response(
+                    {
+                        "reply": blocked_response(self.config, decision, direction="output"),
+                        "blocked": True,
+                        "safety": decision.public_payload(),
+                        "ai_generated": True,
+                    }
+                )
             self.logger.bind(tag=TAG, error_type=type(e).__name__).error(
                 "debug_chat_failed"
             )
             return self._error_response("Debug Chat 调用失败", status=500)
+
+        output_decision = moderate_text(
+            self.config,
+            reply,
+            direction="output",
+            source="debug_chat",
+            user_id=user["id"],
+            device_id=device["id"],
+            session_id=safety_session_id,
+        )
+        if output_decision.blocked:
+            return self._json_response(
+                {
+                    "reply": blocked_response(self.config, output_decision, direction="output"),
+                    "blocked": True,
+                    "safety": output_decision.public_payload(),
+                    "ai_generated": True,
+                }
+            )
 
         session_id = f"demo_chat_{uuid.uuid4().hex}"
         if not consume_energy(self.config, user["id"], device["id"], 5, "debug_chat"):
@@ -724,6 +925,8 @@ class AppDemoHandler(BaseHandler):
                 "dialogue": dialogue,
                 "memory_action": memory_control.get("action"),
                 "memory_error": memory_control.get("error"),
+                "blocked": False,
+                "ai_generated": True,
             }
         )
 
@@ -1129,6 +1332,8 @@ class AppDemoHandler(BaseHandler):
         llm_config = self.config.get("LLM", {}).get(selected_module)
         if not llm_config:
             raise ValueError(f"LLM 配置缺失: {selected_module}")
+        llm_config = dict(llm_config)
+        llm_config["_content_safety"] = self.config.get("content_safety", {}) or {}
         self._demo_llm = self.llm_factory(llm_config.get("type", selected_module), llm_config)
         return self._demo_llm
 

@@ -1,6 +1,5 @@
 import time
 import uuid
-import json
 
 
 class ConversationMetrics:
@@ -25,10 +24,6 @@ class ConversationMetrics:
         if len(text) > limit:
             return text[:limit] + "..."
         return text
-
-    @staticmethod
-    def _quote(value):
-        return json.dumps(value, ensure_ascii=False)
 
     def set_question(self, text):
         self.question = self._clean_text(text)
@@ -86,7 +81,7 @@ class ConversationMetrics:
             f"tts_segments={self.tts_segments} "
             f"opus_frames={self.opus_frames} "
             f"opus_bytes={self.opus_bytes} "
-            f"question={self._quote(self.question)} "
-            f"answer={self._quote(self.answer)} | "
+            f"question_chars={len(self.question)} "
+            f"answer_chars={len(self.answer)} | "
             + " -> ".join(parts)
         )

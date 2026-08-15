@@ -58,6 +58,14 @@ from core.api.app_memory_store import (
     retrieve_memory_context,
 )
 from core.voice_dialogue_gate import enqueue_spirit_power_notice
+from core.content_safety import (
+    append_content_safety_prompt,
+    blocked_response,
+    content_safety_enabled,
+    is_provider_moderation_error,
+    moderate_text,
+    provider_block_decision,
+)
 
 
 TAG = __name__
@@ -178,6 +186,7 @@ class ConnectionHandler:
         self.pending_app_dialogue = None
         self.tts_successful_sentence_id = None
         self.current_metrics = None
+        self.safety_blocked_turn = False
 
         # llm相关变量
         self.dialogue = Dialogue()
@@ -713,6 +722,9 @@ class ConnectionHandler:
                 self.headers.get("client-id", self.headers.get("device-id")),
             )
             private_config["delete_audio"] = bool(self.config.get("delete_audio", True))
+            private_config["content_safety"] = copy.deepcopy(
+                self.common_config.get("content_safety", {}) or {}
+            )
             self.logger.bind(tag=TAG).info(
                 f"{time.time() - begin_time} 秒，异步获取差异化配置成功: {json.dumps(filter_sensitive_info(private_config), ensure_ascii=False)}"
             )
@@ -868,7 +880,10 @@ class ConnectionHandler:
                 # 如果配置了专用LLM，则创建独立的LLM实例
                 from core.utils import llm as llm_utils
 
-                memory_llm_config = self.config["LLM"][memory_llm_name]
+                memory_llm_config = dict(self.config["LLM"][memory_llm_name])
+                memory_llm_config["_content_safety"] = self.common_config.get(
+                    "content_safety", {}
+                ) or {}
                 memory_llm_type = memory_llm_config.get("type", memory_llm_name)
                 memory_llm = llm_utils.create_instance(
                     memory_llm_type, memory_llm_config
@@ -910,7 +925,10 @@ class ConnectionHandler:
                 # 如果配置了专用LLM，则创建独立的LLM实例
                 from core.utils import llm as llm_utils
 
-                intent_llm_config = self.config["LLM"][intent_llm_name]
+                intent_llm_config = dict(self.config["LLM"][intent_llm_name])
+                intent_llm_config["_content_safety"] = self.common_config.get(
+                    "content_safety", {}
+                ) or {}
                 intent_llm_type = intent_llm_config.get("type", intent_llm_name)
                 intent_llm = llm_utils.create_instance(
                     intent_llm_type, intent_llm_config
@@ -932,9 +950,61 @@ class ConnectionHandler:
             asyncio.run_coroutine_threadsafe(self.func_handler._initialize(), self.loop)
 
     def change_system_prompt(self, prompt):
-        self.prompt = prompt
+        self.prompt = append_content_safety_prompt(self.common_config, prompt)
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
+
+    def _moderate_voice_text(self, text, direction):
+        app_device = self._resolve_app_device()
+        return moderate_text(
+            self.common_config,
+            text,
+            direction=direction,
+            source="voice",
+            user_id=app_device.get("user_id") if app_device else None,
+            device_id=app_device.get("id") if app_device else self.device_id,
+            session_id=self.session_id,
+            metadata={"sentence_id": self.sentence_id or ""},
+        )
+
+    def _moderate_voice_output(self, text):
+        decision = self._moderate_voice_text(text, "output")
+        if decision.blocked:
+            self.pending_app_dialogue = None
+            self.memory_turn_opt_out = True
+            self.safety_blocked_turn = True
+            return blocked_response(self.common_config, decision, direction="output"), decision
+        return text, decision
+
+    def _emit_buffered_emotion(self, text):
+        if not text or not (self.features or {}).get("emoji", True):
+            return
+        asyncio.run_coroutine_threadsafe(textUtils.get_emotion(self, text), self.loop)
+
+    def _queue_guard_reply(self, sentence_id, reply, *, include_start=False):
+        if include_start:
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=sentence_id,
+                    sentence_type=SentenceType.FIRST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+        self.tts.tts_text_queue.put(
+            TTSMessageDTO(
+                sentence_id=sentence_id,
+                sentence_type=SentenceType.MIDDLE,
+                content_type=ContentType.TEXT,
+                content_detail=reply,
+            )
+        )
+        self.tts.tts_text_queue.put(
+            TTSMessageDTO(
+                sentence_id=sentence_id,
+                sentence_type=SentenceType.LAST,
+                content_type=ContentType.ACTION,
+            )
+        )
 
     def chat(self, query, depth=0):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
@@ -957,6 +1027,25 @@ class ConnectionHandler:
             if self.current_metrics is None:
                 self.current_metrics = ConversationMetrics(current_sentence_id[:8])
             self.current_metrics.mark("chat_start", text_len=len(query or ""))
+            self.safety_blocked_turn = False
+            input_decision = self._moderate_voice_text(query or "", "input")
+            if input_decision.blocked:
+                guard_reply = blocked_response(
+                    self.common_config, input_decision, direction="input"
+                )
+                self.safety_blocked_turn = True
+                self.pending_app_dialogue = None
+                self.memory_turn_opt_out = True
+                self.current_metrics.set_answer(guard_reply)
+                self.current_metrics.mark(
+                    "content_safety_block",
+                    direction="input",
+                    category=(input_decision.categories or ("unknown",))[0],
+                )
+                self._queue_guard_reply(
+                    current_sentence_id, guard_reply, include_start=True
+                )
+                return False
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1004,6 +1093,7 @@ class ConnectionHandler:
                 functions.append(DIRECT_ANSWER_TOOL)
 
         response_message = []
+        safety_buffer_output = content_safety_enabled(self.common_config)
 
         try:
             # 使用带记忆的对话
@@ -1078,6 +1168,25 @@ class ConnectionHandler:
                     function_call=bool(functions),
                 )
         except Exception as e:
+            if is_provider_moderation_error(e):
+                app_device = self._resolve_app_device()
+                decision = provider_block_decision(
+                    self.common_config,
+                    text=query or "",
+                    direction="input" if query else "output",
+                    source="voice",
+                    user_id=app_device.get("user_id") if app_device else None,
+                    device_id=app_device.get("id") if app_device else self.device_id,
+                    session_id=self.session_id,
+                    error=e,
+                )
+                guard_reply = blocked_response(
+                    self.common_config, decision, direction="output"
+                )
+                self.safety_blocked_turn = True
+                self.pending_app_dialogue = None
+                self._queue_guard_reply(current_sentence_id, guard_reply)
+                return False
             if depth == 0 and self.current_metrics:
                 self.current_metrics.mark("llm_error", error=type(e).__name__)
                 self.logger.bind(tag=TAG).info(self.current_metrics.format_summary())
@@ -1130,7 +1239,7 @@ class ConnectionHandler:
                                     new_part = da_text[sent_len:safe_end]
                                     # 清理 delta 中可能泄漏的 JSON 闭合垃圾
                                     new_part = self._clean_response_garbage(new_part)
-                                    if new_part:
+                                    if new_part and not safety_buffer_output:
                                         tc["_da_sent"] = safe_end
                                         self.tts.tts_text_queue.put(
                                             TTSMessageDTO(
@@ -1144,7 +1253,12 @@ class ConnectionHandler:
                     content = response
 
                 # 在 llm 回复开头获取情绪。流式首片段可能很短，所以先攒一小段再判定。
-                if emotion_flag and content is not None and content.strip():
+                if (
+                    not safety_buffer_output
+                    and emotion_flag
+                    and content is not None
+                    and content.strip()
+                ):
                     emotion_text_buffer += content
                     selected_emotion = textUtils.select_baize_emotion(
                         emotion_text_buffer,
@@ -1173,7 +1287,7 @@ class ConnectionHandler:
                     if not tool_call_flag:
                         response_message.append(content)
                         cleaned_content = clean_baize_text(content)
-                        if cleaned_content:
+                        if cleaned_content and not safety_buffer_output:
                             self.tts.tts_text_queue.put(
                                 TTSMessageDTO(
                                     sentence_id=current_sentence_id,
@@ -1183,7 +1297,27 @@ class ConnectionHandler:
                                 )
                             )
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
+            if is_provider_moderation_error(e):
+                app_device = self._resolve_app_device()
+                decision = provider_block_decision(
+                    self.common_config,
+                    direction="output",
+                    source="voice",
+                    user_id=app_device.get("user_id") if app_device else None,
+                    device_id=app_device.get("id") if app_device else self.device_id,
+                    session_id=self.session_id,
+                    error=e,
+                )
+                guard_reply = blocked_response(
+                    self.common_config, decision, direction="output"
+                )
+                self.safety_blocked_turn = True
+                self.pending_app_dialogue = None
+                self._queue_guard_reply(current_sentence_id, guard_reply)
+                return False
+            self.logger.bind(tag=TAG, error_type=type(e).__name__).error(
+                "llm_stream_processing_failed"
+            )
             if depth == 0 and self.current_metrics:
                 self.current_metrics.mark("llm_stream_error", error=type(e).__name__)
             self.tts.tts_text_queue.put(
@@ -1204,7 +1338,8 @@ class ConnectionHandler:
                 )
             return
         if (
-            emotion_flag
+            not safety_buffer_output
+            and emotion_flag
             and emotion_text_buffer.strip()
             and (self.features or {}).get("emoji", True)
         ):
@@ -1239,9 +1374,10 @@ class ConnectionHandler:
                     bHasError = True
                     response_message.append(content_arguments)
                 if bHasError:
-                    self.logger.bind(tag=TAG).error(
-                        f"function call error: {content_arguments}"
-                    )
+                    self.logger.bind(
+                        tag=TAG,
+                        argument_chars=len(content_arguments or ""),
+                    ).error("llm_tool_call_parse_failed")
 
             if not bHasError and len(tool_calls_list) > 0:
                 # 处理 direct_answer 虚拟工具
@@ -1252,37 +1388,72 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).debug(
                         f"模型选择 direct_answer，流式已播报，写入对话历史"
                     )
-                    for tc in direct_answer_calls:
-                        da_response = self._extract_direct_answer_response(tc.get("arguments", "{}"))
-                        if da_response:
-                            # 刷新流式缓冲区中未发送的部分
-                            sent_len = tc.get("_da_sent", 0)
-                            remaining = da_response[sent_len:]
-                            if remaining:
-                                remaining = self._clean_response_garbage(remaining)
-                                if remaining:
-                                    self.tts.tts_text_queue.put(
-                                        TTSMessageDTO(
-                                            sentence_id=current_sentence_id,
-                                            sentence_type=SentenceType.MIDDLE,
-                                            content_type=ContentType.TEXT,
-                                            content_detail=remaining,
-                                        )
-                                    )
-                            # 写入对话历史
-                            da_response = self._clean_response_garbage(da_response)
-                            self.tts.store_tts_text(current_sentence_id, da_response)
-                            self.dialogue.put(Message(role="assistant", content=da_response))
-
-                    if not real_tool_calls:
-                        app_dialogue_text = "".join(
-                            self._clean_response_garbage(
+                    app_dialogue_text = "".join(
+                        self._clean_response_garbage(
+                            self._extract_direct_answer_response(
+                                tc.get("arguments", "{}")
+                            )
+                        )
+                        for tc in direct_answer_calls
+                    )
+                    direct_output_blocked = False
+                    if app_dialogue_text and safety_buffer_output:
+                        app_dialogue_text, decision = self._moderate_voice_output(
+                            app_dialogue_text
+                        )
+                        direct_output_blocked = decision.blocked
+                        self.tts.tts_text_queue.put(
+                            TTSMessageDTO(
+                                sentence_id=current_sentence_id,
+                                sentence_type=SentenceType.MIDDLE,
+                                content_type=ContentType.TEXT,
+                                content_detail=app_dialogue_text,
+                            )
+                        )
+                        self._emit_buffered_emotion(app_dialogue_text)
+                    elif app_dialogue_text:
+                        for tc in direct_answer_calls:
+                            da_response = self._clean_response_garbage(
                                 self._extract_direct_answer_response(
                                     tc.get("arguments", "{}")
                                 )
                             )
-                            for tc in direct_answer_calls
+                            sent_len = tc.get("_da_sent", 0)
+                            remaining = da_response[sent_len:]
+                            if remaining:
+                                self.tts.tts_text_queue.put(
+                                    TTSMessageDTO(
+                                        sentence_id=current_sentence_id,
+                                        sentence_type=SentenceType.MIDDLE,
+                                        content_type=ContentType.TEXT,
+                                        content_detail=remaining,
+                                    )
+                                )
+
+                    if app_dialogue_text:
+                        self.tts.store_tts_text(
+                            current_sentence_id, app_dialogue_text
                         )
+                        self.dialogue.put(
+                            Message(role="assistant", content=app_dialogue_text)
+                        )
+
+                    if direct_output_blocked:
+                        if self.current_metrics:
+                            self.current_metrics.set_answer(app_dialogue_text)
+                            self.current_metrics.mark(
+                                "content_safety_block", direction="output"
+                            )
+                        self.tts.tts_text_queue.put(
+                            TTSMessageDTO(
+                                sentence_id=current_sentence_id,
+                                sentence_type=SentenceType.LAST,
+                                content_type=ContentType.ACTION,
+                            )
+                        )
+                        return False
+
+                    if not real_tool_calls:
                         if depth == 0 and app_dialogue_text:
                             self._stage_app_dialogue(query, app_dialogue_text)
                         if depth == 0:
@@ -1311,6 +1482,34 @@ class ConnectionHandler:
                 streamed_text = ""
                 if len(response_message) > 0:
                     streamed_text = clean_baize_text("".join(response_message))
+                    if safety_buffer_output:
+                        streamed_text, decision = self._moderate_voice_output(
+                            streamed_text
+                        )
+                        self.tts.tts_text_queue.put(
+                            TTSMessageDTO(
+                                sentence_id=current_sentence_id,
+                                sentence_type=SentenceType.MIDDLE,
+                                content_type=ContentType.TEXT,
+                                content_detail=streamed_text,
+                            )
+                        )
+                        self._emit_buffered_emotion(streamed_text)
+                        if decision.blocked:
+                            self.tts.store_tts_text(
+                                current_sentence_id, streamed_text
+                            )
+                            self.dialogue.put(
+                                Message(role="assistant", content=streamed_text)
+                            )
+                            self.tts.tts_text_queue.put(
+                                TTSMessageDTO(
+                                    sentence_id=current_sentence_id,
+                                    sentence_type=SentenceType.LAST,
+                                    content_type=ContentType.ACTION,
+                                )
+                            )
+                            return False
                     self.tts.store_tts_text(current_sentence_id, streamed_text)
                     self.dialogue.put(Message(role="assistant", content=streamed_text))
                 response_message.clear()
@@ -1318,12 +1517,37 @@ class ConnectionHandler:
                 # 收集所有工具调用的 Future
                 futures_with_data = []
                 for tool_call_data in tool_calls_list:
-                    self.logger.bind(tag=TAG).debug(
-                        f"function_name={tool_call_data['name']}, function_id={tool_call_data['id']}, function_arguments={tool_call_data['arguments']}"
-                    )
+                    self.logger.bind(
+                        tag=TAG,
+                        function_name=tool_call_data["name"],
+                        function_id=tool_call_data["id"],
+                        argument_chars=len(tool_call_data.get("arguments") or ""),
+                    ).debug("llm_tool_call_detected")
 
                     # 使用公共方法上报工具调用
                     tool_input = json.loads(tool_call_data.get("arguments") or "{}")
+                    if content_safety_enabled(self.common_config):
+                        tool_decision = self._moderate_voice_text(
+                            json.dumps(tool_input, ensure_ascii=False), "output"
+                        )
+                        if tool_decision.blocked:
+                            guard_reply = blocked_response(
+                                self.common_config,
+                                tool_decision,
+                                direction="output",
+                            )
+                            self.safety_blocked_turn = True
+                            self.pending_app_dialogue = None
+                            self.tts.store_tts_text(
+                                current_sentence_id, guard_reply
+                            )
+                            self.dialogue.put(
+                                Message(role="assistant", content=guard_reply)
+                            )
+                            self._queue_guard_reply(
+                                current_sentence_id, guard_reply
+                            )
+                            return False
                     enqueue_tool_report(self, tool_call_data['name'], tool_input)
 
                     future = asyncio.run_coroutine_threadsafe(
@@ -1364,8 +1588,22 @@ class ConnectionHandler:
 
         # 存储对话内容
         assistant_text = ""
+        output_blocked = False
         if len(response_message) > 0:
             text_buff = clean_baize_text("".join(response_message))
+            if safety_buffer_output:
+                text_buff, decision = self._moderate_voice_output(text_buff)
+                output_blocked = decision.blocked
+                if text_buff:
+                    self.tts.tts_text_queue.put(
+                        TTSMessageDTO(
+                            sentence_id=current_sentence_id,
+                            sentence_type=SentenceType.MIDDLE,
+                            content_type=ContentType.TEXT,
+                            content_detail=text_buff,
+                        )
+                    )
+                    self._emit_buffered_emotion(text_buff)
             assistant_text = text_buff
             self.tts.store_tts_text(current_sentence_id, text_buff)
             self.dialogue.put(Message(role="assistant", content=text_buff))
@@ -1375,7 +1613,10 @@ class ConnectionHandler:
                 assistant_text = clean_baize_text(
                     self.tts.get_tts_text(current_sentence_id) or ""
                 )
-            self._stage_app_dialogue(query, assistant_text)
+            if output_blocked or self.safety_blocked_turn:
+                self.pending_app_dialogue = None
+            else:
+                self._stage_app_dialogue(query, assistant_text)
             if self.current_metrics:
                 self.current_metrics.set_answer(assistant_text)
                 self.current_metrics.mark("llm_done", assistant_len=len(assistant_text))
@@ -1510,6 +1751,8 @@ class ConnectionHandler:
                 Action.ERROR,
             ]:
                 text = result.response if result.response else result.result
+                if content_safety_enabled(self.common_config):
+                    text, _ = self._moderate_voice_output(str(text or ""))
                 if streamed_text and text in streamed_text:
                     self.logger.bind(tag=TAG).debug(
                         f"Skipping duplicate TTS for tool {tool_call_data['name']}, already streamed"
@@ -1519,6 +1762,15 @@ class ConnectionHandler:
                     self.tts.store_tts_text(self.sentence_id, text)
                 self.dialogue.put(Message(role="assistant", content=text))
             elif result.action == Action.REQLLM:
+                if content_safety_enabled(self.common_config) and result.result:
+                    safe_result, decision = self._moderate_voice_output(
+                        str(result.result)
+                    )
+                    result.result = (
+                        "[工具结果已被内容安全策略拦截]"
+                        if decision.blocked
+                        else safe_result
+                    )
                 need_llm_tools.append((result, tool_call_data))
             elif result.action == Action.RECORD:
                 record_tools.append((result, tool_call_data))

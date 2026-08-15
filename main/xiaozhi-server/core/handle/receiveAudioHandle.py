@@ -11,6 +11,7 @@ from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
 from core.utils.conversation_metrics import ConversationMetrics
+from core.content_safety import evaluate_text
 
 TAG = __name__
 
@@ -86,6 +87,18 @@ async def startToChat(conn: "ConnectionHandler", text):
     # manual 模式下不打断正在播放的内容
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
         await handleAbortMessage(conn)
+
+    # Risky input must not reach intent classification or tool routing. The
+    # chat worker performs the recorded decision and sends the safe response.
+    if not evaluate_text(
+        conn.common_config, actual_text, direction="input"
+    ).allowed:
+        await send_stt_message(conn, actual_text)
+        if conn.current_metrics:
+            conn.current_metrics.mark("content_safety_precheck")
+        conn.client_abort = False
+        conn.executor.submit(conn.chat, actual_text)
+        return
 
     # 首先进行意图分析，使用实际文本内容
     if conn.current_metrics:

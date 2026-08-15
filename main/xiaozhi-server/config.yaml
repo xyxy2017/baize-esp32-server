@@ -41,6 +41,19 @@ server:
   mqtt_signature_key: null
   # UDP网关配置
   udp_gateway: null
+# 白泽内容安全。默认使用本地规则强制拦截；百炼安全护栏需先在阿里云控制台授权后开启。
+content_safety:
+  enabled: true
+  mode: enforce # enforce / audit / off
+  audit_all: false
+  audit_retention_days: 180
+  max_text_chars: 12000
+  upstream_data_inspection: false
+  input_block_message: "这个话题不适合继续聊，我们换一个轻松、安全的话题吧。"
+  output_block_message: "刚才的回答不够合适，我们换一个轻松、安全的话题吧。"
+  self_harm_message: "听起来你现在可能很难受。请先远离危险物品，尽快联系身边可信任的人陪着你；如果有立即危险，请拨打 110 或 120。"
+  custom_rules: []
+  exempt_patterns: []
 log:
   # 设置控制台输出的日志格式，时间、日志级别、标签、消息
   log_format: "<green>{time:YYMMDD HH:mm:ss}</green>[{version}_{selected_module}][<light-blue>{extra[tag]}</light-blue>]-<level>{level}</level>-<light-green>{message}</light-green>"

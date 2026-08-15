@@ -9,6 +9,7 @@ from aiohttp import web
 
 from core.api.app_demo_store import app_mvp_db_path_from_config, ensure_db
 from core.api.base_handler import BaseHandler
+from core.content_safety import content_safety_config, content_safety_enabled
 from core.telemetry import set_sqlite_health
 
 
@@ -38,6 +39,15 @@ class HealthHandler(BaseHandler):
             "websocket_port": int(self.config.get("server", {}).get("port", 8000)),
             "websocket": self.config.get("server", {}).get("websocket", ""),
             "sqlite": db,
+            "content_safety": {
+                "enabled": content_safety_enabled(self.config),
+                "mode": content_safety_config(self.config)["mode"],
+                "upstream_data_inspection": bool(
+                    content_safety_config(self.config).get(
+                        "upstream_data_inspection", False
+                    )
+                ),
+            },
         }
         response = web.Response(
             text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),

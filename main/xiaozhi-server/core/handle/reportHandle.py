@@ -130,7 +130,11 @@ def enqueue_tts_report(conn: "ConnectionHandler", text, opus_data):
                 f"TTS数据已加入上报队列: {conn.device_id}, 不上报音频"
             )
     except Exception as e:
-        conn.logger.bind(tag=TAG).error(f"加入TTS上报队列失败: {text}, {e}")
+        conn.logger.bind(
+            tag=TAG,
+            text_chars=len(text or ""),
+            error_type=type(e).__name__,
+        ).error("tts_report_enqueue_failed")
 
 
 def enqueue_tool_report(conn: "ConnectionHandler", tool_name: str, tool_input: dict, tool_result: str = None, report_tool_call: bool = True):
@@ -169,7 +173,9 @@ def enqueue_tool_report(conn: "ConnectionHandler", tool_name: str, tool_input: d
             result_content = json.dumps([{"type": "tool_result", "text": result_display}], ensure_ascii=False)
             conn.report_queue.put((3, result_content, None, timestamp + 1))
     except Exception as e:
-        conn.logger.bind(tag=TAG).error(f"加入工具上报队列失败: {e}")
+        conn.logger.bind(tag=TAG, error_type=type(e).__name__).error(
+            "tool_report_enqueue_failed"
+        )
 
 
 def enqueue_asr_report(conn: "ConnectionHandler", text, opus_data):
@@ -197,4 +203,8 @@ def enqueue_asr_report(conn: "ConnectionHandler", text, opus_data):
                 f"ASR数据已加入上报队列: {conn.device_id}, 不上报音频"
             )
     except Exception as e:
-        conn.logger.bind(tag=TAG).debug(f"加入ASR上报队列失败: {text}, {e}")
+        conn.logger.bind(
+            tag=TAG,
+            text_chars=len(text or ""),
+            error_type=type(e).__name__,
+        ).debug("asr_report_enqueue_failed")

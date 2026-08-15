@@ -123,7 +123,9 @@ class PromptManager:
             self.cache_manager.set(self.CacheType.DEVICE_PROMPT, device_cache_key, user_prompt)
             self.logger.bind(tag=TAG).debug(f"设备 {device_id} 的提示词已缓存")
 
-        self.logger.bind(tag=TAG).info(f"使用快速提示词: {user_prompt[:50]}...")
+        self.logger.bind(tag=TAG, prompt_chars=len(user_prompt or "")).info(
+            "quick_prompt_selected"
+        )
         return user_prompt
 
     def _get_current_time_info(self) -> tuple:

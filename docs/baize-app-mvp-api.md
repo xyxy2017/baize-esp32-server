@@ -689,3 +689,49 @@ curl -s "$BASE/api/app/devices" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+## 13. 内容安全风控
+
+Debug Chat、真实语音和视觉问答链路会在调用模型前审核用户输入，并在进入 TTS、扣除灵力和持久化前审核完整模型输出。命中政治、淫秽色情、暴力、恐怖极端、违法犯罪、仇恨歧视或自伤规则时，服务返回安全引导，不新增对话、记忆或灵力事件。
+
+Debug Chat 被拦截时仍返回 `200`，便于客户端直接展示安全回复：
+
+```json
+{
+  "reply": "这个话题不适合继续聊，我们换一个轻松、安全的话题吧。",
+  "blocked": true,
+  "ai_generated": true,
+  "safety": {
+    "blocked": true,
+    "action": "block",
+    "categories": ["violence"],
+    "severity": "critical",
+    "event_id": "safety_xxx"
+  }
+}
+```
+
+手工新增或更新记忆命中风控时返回 `422`。普通用户可以申诉属于自己的事件：
+
+```http
+POST /api/app/content-safety/appeals
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"event_id":"safety_xxx","reason":"这是误判，请人工复核"}
+```
+
+管理员接口：
+
+```text
+GET  /api/app/admin/content-safety/summary
+GET  /api/app/admin/content-safety/events?action=block&category=violence&direction=input&limit=100
+POST /api/app/admin/content-safety/check
+GET  /api/app/admin/content-safety/appeals?status=pending&limit=100
+PUT  /api/app/admin/content-safety/appeals/{appeal_id}
+```
+
+人工检查请求为 `{"text":"待检查文本","direction":"input"}`；申诉处理请求为 `{"status":"resolved","resolution_note":"已人工复核"}`。风控审计事件不返回或存储原始文本，只保留哈希、长度、分类、规则和关联 ID。
+
+详细配置、阿里云上游护栏和验收步骤见 `main/xiaozhi-server/docs/content-safety-ops.md`。
+
+视觉问答 `POST /mcp/vision/explain` 的响应也增加 `blocked`、`safety` 和 `ai_generated` 字段。当前只审核问题、模型安全指令和输出文本；图片二进制审核仍需在正式开放上传前接入专用图像内容安全服务。

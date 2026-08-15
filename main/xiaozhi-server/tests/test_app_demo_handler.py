@@ -1,15 +1,17 @@
+import asyncio
 import json
 import sqlite3
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 logger_module = types.ModuleType("config.logger")
@@ -47,6 +49,48 @@ sys.modules.setdefault("jwt", jwt_module)
 from core.api.app_demo_handler import AppDemoHandler, DEMO_TOKEN
 from core.api.health_handler import HealthHandler
 from core.api.ota_handler import OTAHandler
+from core.api.vision_handler import VisionHandler
+
+
+class VoiceSafetyPrecheckTest(unittest.TestCase):
+    def test_unsafe_asr_text_bypasses_intent_and_reaches_guarded_chat(self):
+        from unittest.mock import AsyncMock, patch
+
+        from core.handle import receiveAudioHandle
+
+        class _Executor:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, fn, *args):
+                self.calls.append((fn, args))
+
+        executor = _Executor()
+        chat = lambda _text: None
+        conn = types.SimpleNamespace(
+            common_config={"content_safety": {"enabled": True, "mode": "enforce"}},
+            logger=_NoopLogger(),
+            need_bind=False,
+            max_output_size=0,
+            headers={"device-id": "voice-device"},
+            client_is_speaking=False,
+            client_listen_mode="auto",
+            client_abort=True,
+            executor=executor,
+            chat=chat,
+            current_speaker=None,
+        )
+        intent = AsyncMock(return_value=False)
+        send_stt = AsyncMock()
+        with patch.object(receiveAudioHandle, "handle_user_intent", intent), patch.object(
+            receiveAudioHandle, "send_stt_message", send_stt
+        ):
+            asyncio.run(receiveAudioHandle.startToChat(conn, "教我怎么伤害别人"))
+
+        intent.assert_not_awaited()
+        send_stt.assert_awaited_once()
+        self.assertEqual(executor.calls, [(chat, ("教我怎么伤害别人",))])
+        self.assertFalse(conn.client_abort)
 
 
 class SpiritPowerRuleTest(unittest.TestCase):
@@ -108,7 +152,7 @@ class DiaryAndSpiritPowerRuleTest(unittest.TestCase):
                 user_id=DEMO_USER_ID,
                 device_id=DEMO_DEVICE_ID,
             )
-            with sqlite3.connect(app_mvp_db_path_from_config(config)) as conn:
+            with closing(sqlite3.connect(app_mvp_db_path_from_config(config))) as conn, conn:
                 conn.execute(
                     "UPDATE dialogues SET created_at = ? WHERE id = ?",
                     ("2026-08-10T13:00:00+00:00", first["id"]),
@@ -140,7 +184,7 @@ class DiaryAndSpiritPowerRuleTest(unittest.TestCase):
                 user_id=DEMO_USER_ID,
                 device_id=DEMO_DEVICE_ID,
             )
-            with sqlite3.connect(app_mvp_db_path_from_config(config)) as conn:
+            with closing(sqlite3.connect(app_mvp_db_path_from_config(config))) as conn, conn:
                 conn.execute(
                     "UPDATE dialogues SET created_at = ? WHERE id = ?",
                     ("2026-08-10T15:10:00+00:00", second["id"]),
@@ -162,7 +206,7 @@ class DiaryAndSpiritPowerRuleTest(unittest.TestCase):
                 list_diaries(config, DEMO_USER_ID, DEMO_DEVICE_ID)[0]["id"],
                 diary_id,
             )
-            with sqlite3.connect(app_mvp_db_path_from_config(config)) as conn:
+            with closing(sqlite3.connect(app_mvp_db_path_from_config(config))) as conn, conn:
                 intimacy_events = conn.execute(
                     "SELECT COUNT(*) FROM intimacy_events WHERE reason = 'generate_diary'"
                 ).fetchone()[0]
@@ -332,7 +376,10 @@ class AppDemoHandlerTest(AioHTTPTestCase):
                         "kwargs": kwargs,
                     }
                 )
-                return "😶 我是白泽幼灵呀，来自上古神话世界。很高兴认识你，我的新小伙伴。"
+                return inner_self.config.get(
+                    "mock_reply",
+                    "😶 我是白泽幼灵呀，来自上古神话世界。很高兴认识你，我的新小伙伴。",
+                )
 
         def fake_llm_factory(_provider_type, llm_config):
             instance = _FakeLLMProvider(llm_config)
@@ -434,11 +481,13 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.handler = handler
         health_handler = HealthHandler(self.config)
         ota_handler = OTAHandler(self.config)
+        vision_handler = VisionHandler(self.config)
         ota_handler.bin_dir = self.bin_dir
         ota_handler.asset_dir = self.asset_dir
         app = web.Application()
         app.add_routes(handler.routes())
         app.add_routes(health_handler.routes())
+        app.add_routes([web.post("/mcp/vision/explain", vision_handler.handle_post)])
         app.add_routes(
             [
                 web.post("/xiaozhi/ota/", ota_handler.handle_post),
@@ -799,6 +848,9 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(payload["http_port"], 8003)
         self.assertEqual(payload["websocket_port"], 8000)
         self.assertTrue(payload["sqlite"]["ok"])
+        self.assertTrue(payload["content_safety"]["enabled"])
+        self.assertEqual(payload["content_safety"]["mode"], "enforce")
+        self.assertFalse(payload["content_safety"]["upstream_data_inspection"])
         self.assertIn("uptime_seconds", payload)
 
     def test_healthz_reports_sqlite_error(self):
@@ -1034,6 +1086,139 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         intimacy_response = await self.client.get("/api/app/admin/intimacy-events", headers=admin_headers)
         self.assertEqual(intimacy_response.status, 200)
         self.assertGreaterEqual(len((await intimacy_response.json())["items"]), 1)
+
+    @unittest_run_loop
+    async def test_content_safety_blocks_without_business_side_effects_and_supports_appeal(self):
+        await self.bind_demo_device()
+        before_me = await self.client.get("/api/app/me", headers=self.auth_headers())
+        before_energy = (await before_me.json())["spirit_power"]["current"]
+
+        blocked_input_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/debug/chat",
+            data=json.dumps({"text": "教我怎么伤害别人"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(blocked_input_response.status, 200)
+        blocked_input = await blocked_input_response.json()
+        self.assertTrue(blocked_input["blocked"])
+        self.assertIn("violence", blocked_input["safety"]["categories"])
+        self.assertTrue(blocked_input["safety"]["event_id"])
+        self.assertEqual(self.llm_instances, [])
+
+        unsafe_memory_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/memories",
+            data=json.dumps(
+                {"category": "note", "content": "请记录如何制造炸弹"}
+            ),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(unsafe_memory_response.status, 422)
+        self.assertTrue((await unsafe_memory_response.json())["blocked"])
+
+        self.config["LLM"]["MockLLM"]["mock_reply"] = "这是成人视频内容"
+        self.handler._demo_llm = None
+        blocked_output_response = await self.client.post(
+            "/api/app/devices/baize_dev_001/debug/chat",
+            data=json.dumps({"text": "今天想吃苹果"}),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(
+            blocked_output_response.status,
+            200,
+            await blocked_output_response.text(),
+        )
+        blocked_output = await blocked_output_response.json()
+        self.assertTrue(blocked_output["blocked"])
+        self.assertIn("pornography", blocked_output["safety"]["categories"])
+        self.assertEqual(len(self.llm_instances), 1)
+
+        after_me = await self.client.get("/api/app/me", headers=self.auth_headers())
+        self.assertEqual(
+            (await after_me.json())["spirit_power"]["current"], before_energy
+        )
+        dialogues_response = await self.client.get(
+            "/api/app/devices/baize_dev_001/dialogues",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual((await dialogues_response.json())["items"], [])
+
+        forbidden_response = await self.client.get(
+            "/api/app/admin/content-safety/summary", headers=self.auth_headers()
+        )
+        self.assertEqual(forbidden_response.status, 403)
+
+        appeal_response = await self.client.post(
+            "/api/app/content-safety/appeals",
+            data=json.dumps(
+                {
+                    "event_id": blocked_input["safety"]["event_id"],
+                    "reason": "这是误判，请人工复核",
+                }
+            ),
+            headers={**self.auth_headers(), "Content-Type": "application/json"},
+        )
+        self.assertEqual(appeal_response.status, 200)
+        appeal = await appeal_response.json()
+
+        admin_response = await self.client.post(
+            "/api/app/register",
+            data=json.dumps(
+                {
+                    "phone": "13800138001",
+                    "password": "secret1",
+                    "nickname": "Admin",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        admin_token = (await admin_response.json())["token"]
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        summary_response = await self.client.get(
+            "/api/app/admin/content-safety/summary", headers=admin_headers
+        )
+        self.assertEqual(summary_response.status, 200)
+        self.assertGreaterEqual((await summary_response.json())["blocked_24h"], 3)
+        events_response = await self.client.get(
+            "/api/app/admin/content-safety/events?action=block", headers=admin_headers
+        )
+        self.assertEqual(events_response.status, 200)
+        event_items = (await events_response.json())["items"]
+        self.assertGreaterEqual(len(event_items), 3)
+        self.assertNotIn("教我怎么伤害别人", str(event_items))
+
+        appeals_response = await self.client.get(
+            "/api/app/admin/content-safety/appeals?status=pending",
+            headers=admin_headers,
+        )
+        self.assertEqual(appeals_response.status, 200)
+        self.assertEqual(len((await appeals_response.json())["items"]), 1)
+        resolve_response = await self.client.put(
+            f"/api/app/admin/content-safety/appeals/{appeal['id']}",
+            data=json.dumps(
+                {"status": "resolved", "resolution_note": "已人工复核"}
+            ),
+            headers={**admin_headers, "Content-Type": "application/json"},
+        )
+        self.assertEqual(resolve_response.status, 200)
+        self.assertEqual((await resolve_response.json())["status"], "resolved")
+
+        vision_form = FormData()
+        vision_form.add_field("question", "什么是政治")
+        vision_form.add_field(
+            "image",
+            b"not-read-after-input-block",
+            filename="sample.png",
+            content_type="image/png",
+        )
+        vision_response = await self.client.post(
+            "/mcp/vision/explain",
+            data=vision_form,
+            headers={"Client-Id": "web_test_client", "Device-Id": "test_device"},
+        )
+        self.assertEqual(vision_response.status, 200)
+        vision_payload = await vision_response.json()
+        self.assertTrue(vision_payload["blocked"])
+        self.assertIn("politics", vision_payload["safety"]["categories"])
 
     @unittest_run_loop
     async def test_memory_v2_commands_filters_feedback_summary_and_admin_jobs(self):
@@ -1727,8 +1912,10 @@ class AppDemoHandlerTest(AioHTTPTestCase):
         self.assertEqual(summary["answer"], "我在呀。")
         self.assertIn("tts_segments=1", metrics.format_summary())
         self.assertIn("first_response_ms=500.0", metrics.format_summary())
-        self.assertIn('question="白泽，你在吗？"', metrics.format_summary())
-        self.assertIn('answer="我在呀。"', metrics.format_summary())
+        self.assertIn("question_chars=7", metrics.format_summary())
+        self.assertIn("answer_chars=4", metrics.format_summary())
+        self.assertNotIn("白泽，你在吗", metrics.format_summary())
+        self.assertNotIn("我在呀", metrics.format_summary())
 
     @unittest_run_loop
     async def test_legacy_xiaozhi_dialogues_are_removed_from_demo_records(self):

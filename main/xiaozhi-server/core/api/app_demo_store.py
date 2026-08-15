@@ -486,8 +486,10 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
     )
     _migrate_schema(conn)
     from core.api.app_memory_store import ensure_memory_v2_schema
+    from core.content_safety import ensure_content_safety_schema
 
     ensure_memory_v2_schema(conn)
+    ensure_content_safety_schema(conn)
     conn.commit()
 
 
@@ -1933,6 +1935,12 @@ def append_dialogue(
     baize_text = clean_baize_text(baize_text)
     if not user_text or not baize_text:
         return {}
+    from core.content_safety import evaluate_text
+
+    if not evaluate_text(config, user_text, direction="input").allowed:
+        return {}
+    if not evaluate_text(config, baize_text, direction="output").allowed:
+        return {}
 
     db_path = app_mvp_db_path_from_config(config)
     ensure_db(db_path)
@@ -2329,6 +2337,14 @@ def generate_diary(
                 ).fetchone()
             diary_date = _date_from_iso(latest["created_at"]) if latest else today_key()
         dialogues = _dialogues_for_date(conn, user_id, device_id, diary_date, shared_device_dialogues)
+        from core.content_safety import evaluate_text
+
+        dialogues = [
+            item
+            for item in dialogues
+            if evaluate_text(config, item.get("user_text", ""), direction="diary").allowed
+            and evaluate_text(config, item.get("baize_text", ""), direction="diary").allowed
+        ]
         if not dialogues:
             return {}
         quotes = [

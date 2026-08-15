@@ -20,10 +20,33 @@ for path in \
   core/api/app_demo_store.py \
   core/api/app_demo_handler.py \
   core/api/health_handler.py \
+  core/api/vision_handler.py \
+  core/content_safety.py \
   core/http_server.py \
   core/connection.py \
+  core/handle/helloHandle.py \
+  core/handle/intentHandler.py \
+  core/handle/receiveAudioHandle.py \
+  core/handle/reportHandle.py \
+  core/handle/sendAudioHandle.py \
+  core/handle/textHandler/listenMessageHandler.py \
+  core/memory_embedding.py \
+  core/memory_worker.py \
+  core/telemetry.py \
+  core/utils/conversation_metrics.py \
+  core/utils/dialogue.py \
+  core/utils/modules_initialize.py \
+  core/utils/prompt_manager.py \
+  core/utils/textUtils.py \
+  core/providers/llm/openai/openai.py \
   tests/test_app_demo_handler.py \
-  tests/test_device_mcp_handler.py
+  tests/test_content_safety.py \
+  tests/test_device_mcp_handler.py \
+  tests/test_memory_v2.py \
+  tests/test_memory_embedding.py \
+  tests/test_telemetry.py \
+  deploy/monitoring/baize-alerts.yml \
+  deploy/monitoring/baize-overview.json
 do
   if [[ -e "${path}" ]]; then
     mkdir -p "${backup_dir}/$(dirname "${path}")"
@@ -36,11 +59,44 @@ echo "[deploy] py_compile"
   core/api/app_demo_store.py \
   core/api/app_demo_handler.py \
   core/api/health_handler.py \
+  core/api/vision_handler.py \
+  core/content_safety.py \
   core/http_server.py \
-  core/connection.py
+  core/connection.py \
+  core/handle/helloHandle.py \
+  core/handle/intentHandler.py \
+  core/handle/receiveAudioHandle.py \
+  core/handle/reportHandle.py \
+  core/handle/sendAudioHandle.py \
+  core/handle/textHandler/listenMessageHandler.py \
+  core/memory_embedding.py \
+  core/memory_worker.py \
+  core/telemetry.py \
+  core/utils/conversation_metrics.py \
+  core/utils/dialogue.py \
+  core/utils/modules_initialize.py \
+  core/utils/prompt_manager.py \
+  core/utils/textUtils.py \
+  core/providers/llm/openai/openai.py
 
 echo "[deploy] unit tests"
-"${PYTHON_BIN}" -m unittest -v tests.test_app_demo_handler tests.test_device_mcp_handler
+"${PYTHON_BIN}" -m unittest -v \
+  tests.test_app_demo_handler \
+  tests.test_content_safety \
+  tests.test_device_mcp_handler \
+  tests.test_memory_v2 \
+  tests.test_memory_embedding \
+  tests.test_telemetry
+
+if systemctl list-unit-files | grep -q '^grafana-server.service' && [[ -d /var/lib/grafana/dashboards ]]; then
+  sudo install -m 0644 deploy/monitoring/baize-overview.json /var/lib/grafana/dashboards/baize-overview.json
+  sudo systemctl restart grafana-server
+fi
+if systemctl list-unit-files | grep -q '^prometheus.service' && [[ -d /etc/prometheus ]]; then
+  sudo install -m 0644 deploy/monitoring/baize-alerts.yml /etc/prometheus/baize-alerts.yml
+  command -v promtool >/dev/null 2>&1 && sudo promtool check rules /etc/prometheus/baize-alerts.yml
+  sudo systemctl reload prometheus || sudo systemctl restart prometheus
+fi
 
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
   echo "[deploy] restart systemd service ${SERVICE_NAME}"

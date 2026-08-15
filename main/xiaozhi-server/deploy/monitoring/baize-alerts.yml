@@ -26,3 +26,8 @@ groups:
         for: 5m
         labels: {severity: warning}
         annotations: {summary: "Baize HTTP 5xx rate exceeds 5%"}
+      - alert: BaizeContentSafetyProviderSpike
+        expr: increase(baize_content_safety_provider_errors_total[5m]) > 10
+        for: 1m
+        labels: {severity: warning}
+        annotations: {summary: "Baize upstream content guard blocks or errors exceeded 10 in 5 minutes"}

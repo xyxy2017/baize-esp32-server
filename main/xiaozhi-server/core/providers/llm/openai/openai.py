@@ -4,6 +4,7 @@ from openai.types import CompletionUsage
 from config.logger import setup_logging
 from core.utils.util import check_model_key
 from core.providers.llm.base import LLMProviderBase
+from core.content_safety import aliyun_data_inspection_headers
 from urllib.parse import urlparse
 
 TAG = __name__
@@ -68,7 +69,19 @@ class LLMProvider(LLMProviderBase):
         model_key_msg = check_model_key("LLM", self.api_key)
         if model_key_msg:
             logger.bind(tag=TAG).error(model_key_msg)
-        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=custom_timeout)
+        safety = config.get("_content_safety", {}) or {}
+        default_headers = aliyun_data_inspection_headers(safety, self.base_url)
+        self.data_inspection_enabled = bool(default_headers)
+        if default_headers:
+            logger.bind(tag=TAG).info("已启用阿里云百炼输入输出安全护栏")
+        client_kwargs = dict(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=custom_timeout,
+        )
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+        self.client = openai.OpenAI(**client_kwargs)
 
     @staticmethod
     def normalize_dialogue(dialogue):
