@@ -1150,11 +1150,12 @@ TTS:
   AliBLTTS:
     # 阿里百炼CosyVoice大模型流式文本语音合成
     # 可在这里找到你的 api_key https://bailian.console.aliyun.com/?apiKey=1#/api-key
-    # cosyvoice-v3和部分音色需要申请开通
+    # cosyvoice-v3.5和复刻音色需要在同一百炼业务空间开通/创建
     type: alibl_stream
     api_key: 你的api_key
-    model: "cosyvoice-v2"
-    voice: "longcheng_v2"
+    ws_url: "wss://llm-ej3dxplcnblp9594.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+    model: "cosyvoice-v3.5-flash"
+    voice: "cosyvoice-v3.5-flash-vd-bailian-1a8fa0b31f764a76879ccc1a20ad7b73"
     output_dir: tmp/
     # 以下可不用设置，使用默认设置
     # format: pcm  # 音频格式：pcm、wav、mp3、opus

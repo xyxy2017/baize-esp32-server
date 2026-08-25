@@ -1,3 +1,4 @@
+import os
 from typing import Dict, Any
 from config.logger import setup_logging
 from core.utils import tts, llm, intent, memory, vad, asr
@@ -107,9 +108,25 @@ def initialize_tts(config):
         if "type" not in config["TTS"][select_tts_module]
         else config["TTS"][select_tts_module]["type"]
     )
+    tts_config = dict(config["TTS"][select_tts_module])
+    api_key_env = tts_config.pop("api_key_env", None)
+    api_key_from = tts_config.pop("api_key_from", None)
+    if api_key_env and os.getenv(api_key_env):
+        tts_config["api_key"] = os.environ[api_key_env]
+    elif api_key_from:
+        referenced_value = config
+        try:
+            for segment in api_key_from.split("."):
+                referenced_value = referenced_value[segment]
+        except (KeyError, TypeError):
+            raise ValueError(f"TTS api_key_from 配置不存在: {api_key_from}")
+        if not referenced_value:
+            raise ValueError(f"TTS api_key_from 配置为空: {api_key_from}")
+        tts_config["api_key"] = referenced_value
+
     new_tts = tts.create_instance(
         tts_type,
-        config["TTS"][select_tts_module],
+        tts_config,
         str(config.get("delete_audio", True)).lower() in ("true", "1", "yes"),
     )
     return new_tts
@@ -150,4 +167,3 @@ def initialize_voiceprint(asr_instance, config):
     except Exception as e:
         logger.bind(tag=TAG).error(f"动态初始化声纹识别功能失败: {str(e)}")
         return False
-

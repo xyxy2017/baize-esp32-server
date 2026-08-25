@@ -48,6 +48,15 @@ echo \"[deploy] backup=\${backup_dir}\"
 "
 
 echo "[deploy] sync core files"
+ssh "${REMOTE_HOST}" "
+set -e
+cd '${PROJECT_DIR}'
+latest_backup=\$(ls -dt backups/deploy-* | head -1)
+mkdir -p \"\${latest_backup}/core/providers/tts\"
+cp -a core/providers/tts/alibl_stream.py \"\${latest_backup}/core/providers/tts/\" 2>/dev/null || true
+cp -a tests/test_model_configuration.py \"\${latest_backup}/tests/\" 2>/dev/null || true
+cp -a scripts/update_model_config.py scripts/smoke_models.py \"\${latest_backup}/scripts/\" 2>/dev/null || true
+"
 scp \
   core/api/app_demo_store.py \
   core/api/app_demo_handler.py \
@@ -94,6 +103,10 @@ scp \
   "${REMOTE_HOST}:${PROJECT_DIR}/core/providers/llm/openai/"
 
 scp \
+  core/providers/tts/alibl_stream.py \
+  "${REMOTE_HOST}:${PROJECT_DIR}/core/providers/tts/"
+
+scp \
   core/providers/asr/base.py \
   "${REMOTE_HOST}:${PROJECT_DIR}/core/providers/asr/"
 
@@ -105,10 +118,13 @@ scp \
   tests/test_app_demo_handler.py \
   tests/test_content_safety.py \
   tests/test_device_mcp_handler.py \
+  tests/test_model_configuration.py \
   "${REMOTE_HOST}:${PROJECT_DIR}/tests/"
 
 scp \
   scripts/deploy_direct_python.sh \
+  scripts/update_model_config.py \
+  scripts/smoke_models.py \
   "${REMOTE_HOST}:${PROJECT_DIR}/scripts/"
 
 scp \
@@ -150,15 +166,31 @@ cd '${PROJECT_DIR}'
   core/utils/prompt_manager.py \
   core/utils/textUtils.py \
   core/providers/llm/openai/openai.py \
-  core/providers/tools/device_mcp/mcp_handler.py
+  core/providers/tts/alibl_stream.py \
+  core/providers/tools/device_mcp/mcp_handler.py \
+  scripts/update_model_config.py \
+  scripts/smoke_models.py
 
 '${PYTHON_BIN}' -m unittest -v \
   tests.test_app_demo_handler \
   tests.test_content_safety \
   tests.test_device_mcp_handler \
+  tests.test_model_configuration \
   tests.test_memory_v2 \
   tests.test_memory_embedding \
   tests.test_telemetry
+
+candidate_config=\$(mktemp)
+trap 'rm -f "\${candidate_config}"' EXIT
+'${PYTHON_BIN}' scripts/update_model_config.py \
+  --source data/.config.yaml \
+  --output "\${candidate_config}"
+'${PYTHON_BIN}' scripts/smoke_models.py --config "\${candidate_config}"
+'${PYTHON_BIN}' scripts/update_model_config.py \
+  --source "\${candidate_config}" \
+  --output data/.config.yaml
+rm -f "\${candidate_config}"
+trap - EXIT
 
 if systemctl list-unit-files | grep -q '^grafana-server.service' && [[ -d /var/lib/grafana/dashboards ]]; then
   sudo install -m 0644 deploy/monitoring/baize-overview.json /var/lib/grafana/dashboards/baize-overview.json

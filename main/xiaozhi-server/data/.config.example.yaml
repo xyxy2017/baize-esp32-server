@@ -15,7 +15,7 @@ server:
 selected_module:
   ASR: AliyunStreamASR
   LLM: AliLLM
-  TTS: AliBLSambertTTS
+  TTS: AliBLTTS
   Memory: mem_local_short
   Intent: nointent
 
@@ -68,8 +68,8 @@ ASR:
 LLM:
   AliLLM:
     type: openai
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    model_name: deepseek-v4-flash
+    base_url: https://llm-ej3dxplcnblp9594.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    model_name: deepseek-v4-flash-0731
     api_key: YOUR_DASHSCOPE_API_KEY
     temperature: 0.7
     max_tokens: 2000
@@ -87,6 +87,18 @@ TTS:
   EdgeTTS:
     type: edge
     voice: zh-CN-XiaoxiaoNeural
+    output_dir: tmp/
+  AliBLTTS:
+    type: alibl_stream
+    api_key_env: DASHSCOPE_API_KEY
+    api_key_from: LLM.AliLLM.api_key
+    ws_url: wss://llm-ej3dxplcnblp9594.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference
+    model: cosyvoice-v3.5-flash
+    voice: cosyvoice-v3.5-flash-vd-bailian-1a8fa0b31f764a76879ccc1a20ad7b73
+    format: pcm
+    volume: 50
+    rate: 1.0
+    pitch: 1.0
     output_dir: tmp/
   AliBLSambertTTS:
     type: alibl_sambert

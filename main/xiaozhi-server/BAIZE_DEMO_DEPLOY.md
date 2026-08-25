@@ -29,13 +29,20 @@ cp data/.config.example.yaml data/.config.yaml
 | `ASR.AliyunStreamASR.access_key_id` | 阿里云 AccessKey ID |
 | `ASR.AliyunStreamASR.access_key_secret` | 阿里云 AccessKey Secret |
 | `LLM.AliLLM.api_key` | 阿里云百炼 / DashScope API Key |
-| `TTS.AliBLSambertTTS.api_key` | 阿里云百炼 / DashScope API Key |
+| `LLM.AliLLM.base_url` | 百炼业务空间的 OpenAI 兼容地址（`/compatible-mode/v1`） |
+| `TTS.AliBLTTS.api_key_env` | 优先读取 `DASHSCOPE_API_KEY`，适合专属业务空间 Key |
+| `TTS.AliBLTTS.api_key_from` | 环境变量未设置时复用 `LLM.AliLLM.api_key` |
+| `TTS.AliBLTTS.ws_url` | 同一百炼业务空间的实时语音 WebSocket 地址 |
+| `TTS.AliBLTTS.model` / `voice` | CosyVoice 模型 ID 与该模型对应的复刻音色 ID |
 | `app_mvp.sms.sign_name` | 审核通过的阿里云短信签名 |
 | `app_mvp.sms.template_code` | 审核通过的验证码短信模板 Code |
 
 白泽当前审核通过的配置为签名 `燃力猫文化`、模板 `白泽验证码`
 （`SMS_510440112`）、变量名 `code`。模板内容为
 `白泽的验证码为：${code}，请勿泄露于他人！`。
+
+CosyVoice 专属业务空间 Key 建议写入 systemd 已加载的
+`/etc/baize/app-secrets.env`，变量名为 `DASHSCOPE_API_KEY`，不要提交到仓库。
 
 手机验证码短信使用环境变量 `ALIBABA_CLOUD_ACCESS_KEY_ID` 和
 `ALIBABA_CLOUD_ACCESS_KEY_SECRET`。应使用独立 RAM 用户和最小权限，不要把

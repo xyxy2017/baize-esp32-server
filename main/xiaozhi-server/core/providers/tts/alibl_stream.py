@@ -6,6 +6,7 @@ import queue
 import asyncio
 import traceback
 import websockets
+from urllib.parse import urlparse
 
 from asyncio import Task
 from typing import Callable, Any
@@ -35,8 +36,13 @@ class TTSProvider(TTSProviderBase):
             raise ValueError("api_key is required for CosyVoice TTS")
         self.report_on_last = True
 
-        # WebSocket配置
-        self.ws_url = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/"
+        # WebSocket配置。专属部署使用 workspace 域名，公共模型继续兼容默认地址。
+        self.ws_url = config.get(
+            "ws_url", "wss://dashscope.aliyuncs.com/api-ws/v1/inference/"
+        ).strip()
+        parsed_ws_url = urlparse(self.ws_url)
+        if parsed_ws_url.scheme not in ("ws", "wss") or not parsed_ws_url.netloc:
+            raise ValueError("ws_url must be a valid ws:// or wss:// URL")
         self.ws = None
         self._monitor_task = None
         self.activate_session = False
