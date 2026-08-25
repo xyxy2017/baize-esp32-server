@@ -86,6 +86,62 @@ class ModelConfigurationTest(unittest.TestCase):
             "你好", timeout_millis=provider.tts_timeout * 1000
         )
 
+    def test_cosyvoice_streams_callback_pcm_into_audio_queue(self):
+        provider = TTSProvider(
+            {
+                "api_key": "test-key",
+                "ws_url": "wss://workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+                "http_url": "https://workspace.cn-beijing.maas.aliyuncs.com/api/v1",
+                "model": "cosyvoice-v3.5-flash",
+                "voice": "cosyvoice-v3.5-flash-vd-test",
+            },
+            True,
+        )
+        provider.conn = types.SimpleNamespace(
+            sample_rate=16000,
+            client_abort=False,
+            sentence_id="sentence-1",
+            current_metrics=None,
+        )
+        provider.current_sentence_id = "sentence-1"
+        provider.opus_encoder = MagicMock()
+        provider.opus_encoder.encode_pcm_to_opus_stream.side_effect = (
+            lambda data, end_of_stream, callback: callback(b"opus") if data else None
+        )
+
+        def start_stream(text):
+            callback = synthesizer_class.call_args.kwargs["callback"]
+            callback.on_data(b"\x00\x00" * 960)
+
+        def complete_stream(complete_timeout_millis):
+            callback = synthesizer_class.call_args.kwargs["callback"]
+            callback.on_complete()
+
+        synthesizer = MagicMock()
+        synthesizer.streaming_call.side_effect = start_stream
+        synthesizer.streaming_complete.side_effect = complete_stream
+        with patch(
+            "dashscope.audio.tts_v2.SpeechSynthesizer",
+            return_value=synthesizer,
+        ) as synthesizer_class:
+            provider.to_tts_stream("你好", opus_handler=provider.handle_opus)
+
+        first = provider.tts_audio_queue.get_nowait()
+        audio = provider.tts_audio_queue.get_nowait()
+        self.assertEqual(first[0].name, "FIRST")
+        self.assertEqual(first[2], "你好")
+        self.assertEqual(first[3], "sentence-1")
+        self.assertEqual(audio[0].name, "MIDDLE")
+        self.assertEqual(audio[1], b"opus")
+        self.assertEqual(audio[3], "sentence-1")
+        self.assertEqual(
+            provider.opus_encoder.encode_pcm_to_opus_stream.call_count, 2
+        )
+        synthesizer.streaming_call.assert_called_once_with("你好")
+        synthesizer.streaming_complete.assert_called_once_with(
+            complete_timeout_millis=provider.tts_timeout * 1000
+        )
+
     def test_tts_can_reuse_llm_api_key_without_duplicating_secret(self):
         config = {
             "selected_module": {"TTS": "AliBLTTS"},

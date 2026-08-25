@@ -3,11 +3,12 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import dashscope
 import openai
-from dashscope.audio.tts_v2 import AudioFormat, SpeechSynthesizer
+from dashscope.audio.tts_v2 import AudioFormat, ResultCallback, SpeechSynthesizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -63,19 +64,30 @@ def smoke_tts(config):
     if tts.get("http_url"):
         dashscope.base_http_api_url = tts["http_url"]
 
+    audio_bytes = 0
+
+    class SmokeCallback(ResultCallback):
+        def on_data(self, data):
+            nonlocal audio_bytes
+            audio_bytes += len(data or b"")
+
     synthesizer = SpeechSynthesizer(
         model=tts["model"],
         voice=tts["voice"],
-        format=AudioFormat.WAV_16000HZ_MONO_16BIT,
+        format=AudioFormat.PCM_16000HZ_MONO_16BIT,
         volume=int(tts.get("volume", 50)),
         speech_rate=float(tts.get("rate", 1.0)),
         pitch_rate=float(tts.get("pitch", 1.0)),
+        callback=SmokeCallback(),
         url=tts["ws_url"],
     )
-    audio_data = synthesizer.call("你好，我是白泽。", timeout_millis=30000)
-    if not audio_data:
+    started = time.perf_counter()
+    synthesizer.streaming_call("你好，我是白泽。")
+    synthesizer.streaming_complete(complete_timeout_millis=30000)
+    total_ms = round((time.perf_counter() - started) * 1000, 1)
+    if audio_bytes <= 0:
         raise RuntimeError("TTS 冒烟未收到音频")
-    return len(audio_data)
+    return audio_bytes, round(synthesizer.get_first_package_delay(), 1), total_ms
 
 
 def main():
@@ -85,7 +97,7 @@ def main():
 
     config = merge_configs(read_config("config.yaml"), read_config(args.config))
     llm_chars = smoke_llm(config)
-    tts_bytes = smoke_tts(config)
+    tts_bytes, tts_first_packet_ms, tts_total_ms = smoke_tts(config)
     print(
         json.dumps(
             {
@@ -97,6 +109,8 @@ def main():
                     "model"
                 ],
                 "tts_bytes": tts_bytes,
+                "tts_first_packet_ms": tts_first_packet_ms,
+                "tts_total_ms": tts_total_ms,
             },
             ensure_ascii=False,
         )
