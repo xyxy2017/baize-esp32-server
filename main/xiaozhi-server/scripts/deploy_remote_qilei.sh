@@ -53,7 +53,7 @@ set -e
 cd '${PROJECT_DIR}'
 latest_backup=\$(ls -dt backups/deploy-* | head -1)
 mkdir -p \"\${latest_backup}/core/providers/tts\"
-cp -a core/providers/tts/alibl_stream.py \"\${latest_backup}/core/providers/tts/\" 2>/dev/null || true
+cp -a core/providers/tts/alibl_stream.py core/providers/tts/alibl_tts_v2.py \"\${latest_backup}/core/providers/tts/\" 2>/dev/null || true
 cp -a tests/test_model_configuration.py \"\${latest_backup}/tests/\" 2>/dev/null || true
 cp -a scripts/update_model_config.py scripts/smoke_models.py \"\${latest_backup}/scripts/\" 2>/dev/null || true
 "
@@ -104,6 +104,7 @@ scp \
 
 scp \
   core/providers/tts/alibl_stream.py \
+  core/providers/tts/alibl_tts_v2.py \
   "${REMOTE_HOST}:${PROJECT_DIR}/core/providers/tts/"
 
 scp \
@@ -167,6 +168,7 @@ cd '${PROJECT_DIR}'
   core/utils/textUtils.py \
   core/providers/llm/openai/openai.py \
   core/providers/tts/alibl_stream.py \
+  core/providers/tts/alibl_tts_v2.py \
   core/providers/tools/device_mcp/mcp_handler.py \
   scripts/update_model_config.py \
   scripts/smoke_models.py

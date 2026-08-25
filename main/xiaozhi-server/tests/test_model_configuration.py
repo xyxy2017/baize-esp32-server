@@ -1,7 +1,8 @@
+import asyncio
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import yaml
 
@@ -16,13 +17,14 @@ if opus_module is not None and not hasattr(opus_module, "Encoder"):
     )
 
 from config.config_loader import merge_configs
-from core.providers.tts.alibl_stream import TTSProvider
+from core.providers.tts.alibl_tts_v2 import TTSProvider
 from core.utils.modules_initialize import initialize_tts
 from scripts.update_model_config import (
     LLM_BASE_URL,
     LLM_MODEL,
     TTS_MODEL,
     TTS_VOICE,
+    TTS_HTTP_URL,
     TTS_WS_URL,
     apply_model_config,
 )
@@ -49,9 +51,40 @@ class ModelConfigurationTest(unittest.TestCase):
     def test_cosyvoice_rejects_invalid_websocket_endpoint(self):
         with self.assertRaisesRegex(ValueError, "ws_url"):
             TTSProvider(
-                {"api_key": "test-key", "ws_url": "https://example.com/api"},
+                {
+                    "api_key": "test-key",
+                    "voice": "cosyvoice-v3.5-flash-vd-test",
+                    "ws_url": "https://example.com/api",
+                },
                 True,
             )
+
+    def test_cosyvoice_uses_official_tts_v2_sdk(self):
+        provider = TTSProvider(
+            {
+                "api_key": "test-key",
+                "ws_url": "wss://workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+                "http_url": "https://workspace.cn-beijing.maas.aliyuncs.com/api/v1",
+                "model": "cosyvoice-v3.5-flash",
+                "voice": "cosyvoice-v3.5-flash-vd-test",
+            },
+            True,
+        )
+        provider.conn = types.SimpleNamespace(sample_rate=16000)
+        synthesizer = MagicMock()
+        synthesizer.call.return_value = b"test-wav-audio"
+
+        with patch(
+            "dashscope.audio.tts_v2.SpeechSynthesizer",
+            return_value=synthesizer,
+        ) as synthesizer_class:
+            audio = asyncio.run(provider.text_to_speak("你好", None))
+
+        self.assertEqual(audio, b"test-wav-audio")
+        synthesizer_class.assert_called_once()
+        synthesizer.call.assert_called_once_with(
+            "你好", timeout_millis=provider.tts_timeout * 1000
+        )
 
     def test_tts_can_reuse_llm_api_key_without_duplicating_secret(self):
         config = {
@@ -59,8 +92,9 @@ class ModelConfigurationTest(unittest.TestCase):
             "LLM": {"AliLLM": {"api_key": "shared-key"}},
             "TTS": {
                 "AliBLTTS": {
-                    "type": "alibl_stream",
+                    "type": "alibl_tts_v2",
                     "api_key_from": "LLM.AliLLM.api_key",
+                    "voice": "cosyvoice-v3.5-flash-vd-test",
                 }
             },
         }
@@ -73,9 +107,10 @@ class ModelConfigurationTest(unittest.TestCase):
             "LLM": {"AliLLM": {"api_key": "fallback-key"}},
             "TTS": {
                 "AliBLTTS": {
-                    "type": "alibl_stream",
+                    "type": "alibl_tts_v2",
                     "api_key_env": "DASHSCOPE_API_KEY",
                     "api_key_from": "LLM.AliLLM.api_key",
+                    "voice": "cosyvoice-v3.5-flash-vd-test",
                 }
             },
         }
@@ -123,10 +158,13 @@ class ModelConfigurationTest(unittest.TestCase):
         self.assertEqual(updated["LLM"]["AliLLM"]["base_url"], LLM_BASE_URL)
         self.assertEqual(updated["LLM"]["AliLLM"]["model_name"], LLM_MODEL)
         self.assertEqual(updated["selected_module"]["TTS"], "AliBLTTS")
+        self.assertEqual(updated["TTS"]["AliBLTTS"]["type"], "alibl_tts_v2")
         self.assertEqual(updated["TTS"]["AliBLTTS"]["ws_url"], TTS_WS_URL)
+        self.assertEqual(updated["TTS"]["AliBLTTS"]["http_url"], TTS_HTTP_URL)
         self.assertEqual(updated["TTS"]["AliBLTTS"]["model"], TTS_MODEL)
         self.assertEqual(updated["TTS"]["AliBLTTS"]["voice"], TTS_VOICE)
         self.assertNotIn("api_key", updated["TTS"]["AliBLTTS"])
+        self.assertNotIn("api_key_env", updated["TTS"]["AliBLTTS"])
 
 
 if __name__ == "__main__":

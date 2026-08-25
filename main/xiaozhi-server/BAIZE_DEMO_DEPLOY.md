@@ -30,9 +30,9 @@ cp data/.config.example.yaml data/.config.yaml
 | `ASR.AliyunStreamASR.access_key_secret` | 阿里云 AccessKey Secret |
 | `LLM.AliLLM.api_key` | 阿里云百炼 / DashScope API Key |
 | `LLM.AliLLM.base_url` | 百炼业务空间的 OpenAI 兼容地址（`/compatible-mode/v1`） |
-| `TTS.AliBLTTS.api_key_env` | 优先读取 `DASHSCOPE_API_KEY`，适合专属业务空间 Key |
-| `TTS.AliBLTTS.api_key_from` | 环境变量未设置时复用 `LLM.AliLLM.api_key` |
+| `TTS.AliBLTTS.api_key_from` | 复用已与专属域名配对验证的 `LLM.AliLLM.api_key`，避免被旧环境变量覆盖 |
 | `TTS.AliBLTTS.ws_url` | 同一百炼业务空间的实时语音 WebSocket 地址 |
+| `TTS.AliBLTTS.http_url` | 同一百炼业务空间的 HTTP 地址；官方 `dashscope.audio.tts_v2` SDK 与 WebSocket 地址配套使用 |
 | `TTS.AliBLTTS.model` / `voice` | CosyVoice 模型 ID 与该模型对应的复刻音色 ID |
 | `app_mvp.sms.sign_name` | 审核通过的阿里云短信签名 |
 | `app_mvp.sms.template_code` | 审核通过的验证码短信模板 Code |

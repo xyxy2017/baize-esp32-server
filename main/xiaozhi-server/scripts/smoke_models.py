@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 import argparse
-import asyncio
 import json
 import os
 import sys
-import uuid
 from pathlib import Path
 
+import dashscope
 import openai
-import websockets
+from dashscope.audio.tts_v2 import AudioFormat, SpeechSynthesizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -46,112 +45,37 @@ def smoke_llm(config):
         client.close()
 
 
-async def smoke_tts(config):
+def smoke_tts(config):
     name = config["selected_module"]["TTS"]
     tts = config["TTS"][name]
-    api_key = os.getenv(tts.get("api_key_env", "")) or tts.get("api_key")
-    if not api_key and tts.get("api_key_from"):
+    api_key = None
+    if tts.get("api_key_from"):
         api_key = resolve_path(config, tts["api_key_from"])
+    if not api_key and tts.get("api_key_env"):
+        api_key = os.getenv(tts["api_key_env"])
+    if not api_key:
+        api_key = tts.get("api_key")
     if not api_key:
         raise ValueError("TTS API Key 未配置")
 
-    task_id = uuid.uuid4().hex
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "X-DashScope-DataInspection": "enable",
-    }
-    audio_bytes = 0
-    async with websockets.connect(
-        tts["ws_url"],
-        additional_headers=headers,
-        open_timeout=20,
-        close_timeout=10,
-        max_size=10 * 1024 * 1024,
-    ) as websocket:
-        await websocket.send(
-            json.dumps(
-                {
-                    "header": {
-                        "action": "run-task",
-                        "task_id": task_id,
-                        "streaming": "duplex",
-                    },
-                    "payload": {
-                        "task_group": "audio",
-                        "task": "tts",
-                        "function": "SpeechSynthesizer",
-                        "model": tts["model"],
-                        "parameters": {
-                            "text_type": "PlainText",
-                            "voice": tts["voice"],
-                            "format": "pcm",
-                            "sample_rate": 16000,
-                            "volume": tts.get("volume", 50),
-                            "rate": tts.get("rate", 1.0),
-                            "pitch": tts.get("pitch", 1.0),
-                        },
-                        "input": {},
-                    },
-                },
-                ensure_ascii=False,
-            )
-        )
+    dashscope.api_key = api_key
+    dashscope.base_websocket_api_url = tts["ws_url"]
+    if tts.get("http_url"):
+        dashscope.base_http_api_url = tts["http_url"]
 
-        while True:
-            message = await asyncio.wait_for(websocket.recv(), timeout=30)
-            if not isinstance(message, str):
-                continue
-            header = json.loads(message).get("header", {})
-            event = header.get("event")
-            if event == "task-failed":
-                raise RuntimeError(
-                    f"TTS 启动失败: {header.get('error_code')} {header.get('error_message')}"
-                )
-            if event == "task-started":
-                break
-
-        await websocket.send(
-            json.dumps(
-                {
-                    "header": {
-                        "action": "continue-task",
-                        "task_id": task_id,
-                        "streaming": "duplex",
-                    },
-                    "payload": {"input": {"text": "你好，我是白泽。"}},
-                },
-                ensure_ascii=False,
-            )
-        )
-        await websocket.send(
-            json.dumps(
-                {
-                    "header": {
-                        "action": "finish-task",
-                        "task_id": task_id,
-                        "streaming": "duplex",
-                    },
-                    "payload": {"input": {}},
-                }
-            )
-        )
-
-        while True:
-            message = await asyncio.wait_for(websocket.recv(), timeout=30)
-            if isinstance(message, (bytes, bytearray)):
-                audio_bytes += len(message)
-                continue
-            header = json.loads(message).get("header", {})
-            event = header.get("event")
-            if event == "task-failed":
-                raise RuntimeError(
-                    f"TTS 合成失败: {header.get('error_code')} {header.get('error_message')}"
-                )
-            if event == "task-finished":
-                break
-    if audio_bytes <= 0:
+    synthesizer = SpeechSynthesizer(
+        model=tts["model"],
+        voice=tts["voice"],
+        format=AudioFormat.WAV_16000HZ_MONO_16BIT,
+        volume=int(tts.get("volume", 50)),
+        speech_rate=float(tts.get("rate", 1.0)),
+        pitch_rate=float(tts.get("pitch", 1.0)),
+        url=tts["ws_url"],
+    )
+    audio_data = synthesizer.call("你好，我是白泽。", timeout_millis=30000)
+    if not audio_data:
         raise RuntimeError("TTS 冒烟未收到音频")
-    return audio_bytes
+    return len(audio_data)
 
 
 def main():
@@ -161,7 +85,7 @@ def main():
 
     config = merge_configs(read_config("config.yaml"), read_config(args.config))
     llm_chars = smoke_llm(config)
-    tts_bytes = asyncio.run(smoke_tts(config))
+    tts_bytes = smoke_tts(config)
     print(
         json.dumps(
             {
