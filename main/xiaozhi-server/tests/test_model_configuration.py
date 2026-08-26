@@ -23,6 +23,7 @@ from scripts.update_model_config import (
     LLM_BASE_URL,
     LLM_MODEL,
     TTS_MODEL,
+    TTS_RATE,
     TTS_VOICE,
     TTS_HTTP_URL,
     TTS_WS_URL,
@@ -219,6 +220,7 @@ class ModelConfigurationTest(unittest.TestCase):
         self.assertEqual(updated["TTS"]["AliBLTTS"]["http_url"], TTS_HTTP_URL)
         self.assertEqual(updated["TTS"]["AliBLTTS"]["model"], TTS_MODEL)
         self.assertEqual(updated["TTS"]["AliBLTTS"]["voice"], TTS_VOICE)
+        self.assertEqual(updated["TTS"]["AliBLTTS"]["rate"], TTS_RATE)
         self.assertNotIn("api_key", updated["TTS"]["AliBLTTS"])
         self.assertNotIn("api_key_env", updated["TTS"]["AliBLTTS"])
 

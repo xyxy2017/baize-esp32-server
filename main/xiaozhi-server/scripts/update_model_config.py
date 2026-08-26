@@ -19,6 +19,7 @@ TTS_HTTP_URL = (
     "https://llm-ej3dxplcnblp9594.cn-beijing.maas.aliyuncs.com/api/v1"
 )
 TTS_MODEL = "cosyvoice-v3.5-flash"
+TTS_RATE = 0.9
 TTS_VOICE = (
     "cosyvoice-v3.5-flash-vd-bailian-1a8fa0b31f764a76879ccc1a20ad7b73"
 )
@@ -47,7 +48,7 @@ def apply_model_config(config):
             "voice": TTS_VOICE,
             "format": "pcm",
             "volume": 50,
-            "rate": 1.0,
+            "rate": TTS_RATE,
             "pitch": 1.0,
             "output_dir": "tmp/",
         }

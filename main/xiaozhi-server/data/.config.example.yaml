@@ -97,7 +97,7 @@ TTS:
     voice: cosyvoice-v3.5-flash-vd-bailian-1a8fa0b31f764a76879ccc1a20ad7b73
     format: pcm
     volume: 50
-    rate: 1.0
+    rate: 0.9
     pitch: 1.0
     output_dir: tmp/
   AliBLSambertTTS:

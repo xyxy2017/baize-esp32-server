@@ -1157,11 +1157,12 @@ TTS:
     http_url: "https://llm-ej3dxplcnblp9594.cn-beijing.maas.aliyuncs.com/api/v1"
     model: "cosyvoice-v3.5-flash"
     voice: "cosyvoice-v3.5-flash-vd-bailian-1a8fa0b31f764a76879ccc1a20ad7b73"
+    rate: 0.9
     output_dir: tmp/
     # 以下可不用设置，使用默认设置
     # format: pcm  # 音频格式：pcm、wav、mp3、opus
     # volume: 50  # 音量：0-100
-    # rate: 1  # 语速：0.5~2
+    # rate: 0.9  # 语速：0.5~2
     # pitch: 1  # 语调：0.5~2
     # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   AliBLSambertTTS:
